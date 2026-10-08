@@ -3,6 +3,10 @@
 import argparse
 from pathlib import Path
 import sqlite3
+import threading
+import time
+import urllib.request
+import webbrowser
 
 
 ROOT = Path(__file__).resolve().parent
@@ -37,10 +41,10 @@ def main(argv=None):
     export_cmd.add_argument('--out', type=Path, default=DEFAULT_OUT, help='输出目录（默认：项目目录/exports）')
     export_cmd.add_argument('--my-name', default='我', help='自己的显示名')
     web_cmd.add_argument('--port', type=int, default=8765, help='本机端口（默认：8765）')
+    web_cmd.add_argument('--open-browser', action='store_true', help='服务就绪后自动打开浏览器')
 
     args = parser.parse_args(argv)
     try:
-        db_dir = database_dir(args.db)
         if args.command == 'web':
             if not 1 <= args.port <= 65535:
                 parser.error('--port 必须在 1 到 65535 之间')
@@ -51,10 +55,24 @@ def main(argv=None):
                 raise RuntimeError('缺少网页依赖。请运行：python -m pip install -r requirements.txt') from exc
             if not web_app.we.HAS_ZSTD:
                 raise RuntimeError('缺少 zstandard。请运行：python -m pip install -r requirements.txt')
-            web_app.DB_DIR = db_dir
+            web_app.DB_DIR = args.db.resolve()
             print(f'请在浏览器打开 http://127.0.0.1:{args.port}')
-            uvicorn.run(web_app.app, host='127.0.0.1', port=args.port)
+            if args.open_browser:
+                def open_when_ready():
+                    url = f'http://127.0.0.1:{args.port}'
+                    for _ in range(100):
+                        try:
+                            with urllib.request.urlopen(url + '/api/data-status', timeout=1) as response:
+                                if response.status == 200:
+                                    webbrowser.open(url)
+                                    return
+                        except OSError:
+                            time.sleep(.2)
+                threading.Thread(target=open_when_ready, daemon=True).start()
+            uvicorn.run(web_app.app, host='127.0.0.1', port=args.port, access_log=False)
             return
+
+        db_dir = database_dir(args.db)
 
         try:
             from wechat_export import load_contacts, find_contact, export_contact

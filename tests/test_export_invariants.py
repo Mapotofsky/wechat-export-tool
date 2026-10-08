@@ -21,6 +21,7 @@ import run
 import wechat_export as export
 import wcdb_key_tool_windows as key_tool
 from web import app as web_app
+from maintenance import Manager
 
 
 class ExportInvariantTests(unittest.TestCase):
@@ -219,7 +220,7 @@ class ExportInvariantTests(unittest.TestCase):
         self.seed_exportable_contact()
         with patch.object(web_app, "DB_DIR", self.root), patch("uvicorn.run") as serve:
             run.main(["web", "--db", str(self.root), "--port", "8766"])
-            serve.assert_called_once_with(web_app.app, host="127.0.0.1", port=8766)
+            serve.assert_called_once_with(web_app.app, host="127.0.0.1", port=8766, access_log=False)
             self.assertEqual(web_app.DB_DIR, self.root)
 
     def test_missing_database_has_next_step(self):
@@ -228,8 +229,12 @@ class ExportInvariantTests(unittest.TestCase):
 
     def test_local_web_reads_database_and_exports_zip(self):
         username = self.seed_exportable_contact()
-        with patch.object(web_app, "DB_DIR", self.root):
-            self.assertEqual(web_app.data_status(), {"has_data": True, "contacts": 1})
+        manager = Manager(self.root / 'state')
+        manager.select(str(self.root), 'synthetic', True)
+        manager.archive().update(self.root)
+        with patch.object(web_app, "manager", manager):
+            self.assertTrue(web_app.data_status()['has_data'])
+            self.assertEqual(web_app.data_status()['contacts'], 1)
             self.assertEqual(web_app.contacts()[0]["username"], username)
             response = web_app.export(web_app.ExportReq(usernames=[username]))
 
@@ -240,7 +245,7 @@ class ExportInvariantTests(unittest.TestCase):
             self.assertEqual(len(archive.namelist()), 2)
             self.assertTrue(any(name.endswith("_聊天记录.json") for name in archive.namelist()))
 
-    def test_decrypt_reports_encrypted_wal_it_does_not_process(self):
+    def test_batch_decrypt_reports_wal_scope_without_claiming_real_validation(self):
         source = self.root / "message" / "message_0.db"
         with closing(sqlite3.connect(source)) as conn:
             conn.execute("CREATE TABLE sample (value INTEGER)")
@@ -262,7 +267,8 @@ class ExportInvariantTests(unittest.TestCase):
                 result = key_tool.decrypt_all(
                     str(self.root), str(self.root / "decrypted"), str(keys)
                 )
-        self.assertEqual(result["ignored_wals"], ["message\\message_0.db-wal"])
+        self.assertEqual(result["wal_files"], ["message\\message_0.db-wal"])
+        self.assertEqual(result['real_wechat_wal_validation'], 'not_performed')
         self.assertTrue(
             any("WAL" in str(call) for call in output.call_args_list)
         )

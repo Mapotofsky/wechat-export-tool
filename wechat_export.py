@@ -26,6 +26,11 @@ except ImportError:
 ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
 
 
+def is_message_shard(name):
+    """消息实体分片；message_fts/resource 是辅助库。"""
+    return re.fullmatch(r'message_[0-9]+\.db', name) is not None
+
+
 def _connect_ro(path):
     """以只读模式打开 SQLite，同时读取现有 WAL。"""
     return sqlite3.connect(f'file:{path}?mode=ro', uri=True)
@@ -120,16 +125,16 @@ def parse_message(local_type, message_content):
     if base == 10000:
         # 系统消息：解压后可能是文本
         d = decompress(message_content)
-        if isinstance(d, bytes):
-            s = d.decode('utf-8', errors='replace')
+        if isinstance(d, (bytes, str)):
+            s = d.decode('utf-8', errors='replace') if isinstance(d, bytes) else d
             if '撤回' in s or '加入' in s or '邀请' in s:
                 return tname, s.strip()
         return tname, ''
 
     # 链接/文件(49) 及位置(48)：解压后是 XML，提取关键字段
     d = decompress(message_content)
-    if isinstance(d, bytes):
-        xml_text = d.decode('utf-8', errors='replace')
+    if isinstance(d, (bytes, str)):
+        xml_text = d.decode('utf-8', errors='replace') if isinstance(d, bytes) else d
         if base == 48:  # 位置
             label = _clean(_xml_tag(xml_text, 'label'))
             x = _xml_tag(xml_text, 'x')
@@ -183,29 +188,36 @@ def classify_username(username):
 _SELF_ID_CACHE = {}
 
 
-def detect_self_sender_id(db_path):
+def detect_self_sender_id(db_path, self_username=None, with_basis=False):
     """确定某个 message 分片里"自己"的 real_sender_id。
 
-    微信 4.x 存储格式在 2026-03 前后升级，导致 real_sender_id 语义变化：
-    - 新格式（如 message_0.db）：自己 = 4，系统消息 = 9，对方 = 各会话成员编号
-    - 旧格式（如 message_1/2/3.db）：自己 = 1，对方 = 2，群聊额外成员 = 3...
-    优先用 filehelper（消息全部是"自己"发送）做锚点；否则按"分片内是否出现 sid=4"推断。
+    优先使用 filehelper 中唯一的非系统消息发送者；然后查询该分片
+    Name2Id 中用户确认的内部 username；最后保留存在编号 4 则取 4、否则 1
+    的启发式回退。识别依据可通过 with_basis 获取，每次读取重新判断。
     """
-    if db_path in _SELF_ID_CACHE:
-        return _SELF_ID_CACHE[db_path]
     self_id = None
+    basis = 'heuristic_1'
     with closing(_connect_ro(db_path)) as conn:
         cur = conn.cursor()
         # 锚点1：filehelper 表，消息全部是"自己"发的
         fh = 'Msg_' + hashlib.md5(b'filehelper').hexdigest()
         try:
             r = cur.execute(
-                f'SELECT DISTINCT real_sender_id FROM "{fh}" WHERE real_sender_id IS NOT NULL LIMIT 1'
-            ).fetchone()
-            if r and r[0] is not None:
-                self_id = r[0]
+                f'SELECT DISTINCT real_sender_id FROM "{fh}" WHERE real_sender_id IS NOT NULL '
+                'AND (local_type & 4294967295) != 10000 LIMIT 2'
+            ).fetchall()
+            if len(r) == 1:
+                self_id = r[0][0]
+                basis = 'filehelper'
         except Exception:
             pass
+        if self_id is None and self_username:
+            try:
+                r = cur.execute('SELECT rowid FROM Name2Id WHERE user_name=?', (self_username,)).fetchone()
+                if r:
+                    self_id, basis = r[0], 'username_mapping'
+            except sqlite3.OperationalError:
+                pass
         # 锚点2：新格式标志 —— 分片内是否存在 real_sender_id == 4
         if self_id is None:
             try:
@@ -217,13 +229,13 @@ def detect_self_sender_id(db_path):
                         f'SELECT 1 FROM "{name}" WHERE real_sender_id = 4 LIMIT 1'
                     ).fetchone():
                         self_id = 4
+                        basis = 'heuristic_4'
                         break
             except Exception:
                 pass
     if self_id is None:
         self_id = 1  # 旧格式默认：自己 = 1
-    _SELF_ID_CACHE[db_path] = self_id
-    return self_id
+    return (self_id, basis) if with_basis else self_id
 
 
 def collect_msg_tables(db_dir):
@@ -233,7 +245,7 @@ def collect_msg_tables(db_dir):
     if not os.path.isdir(msg_dir):
         return hashes
     for fname in os.listdir(msg_dir):
-        if not (fname.startswith('message_') and fname.endswith('.db')):
+        if not is_message_shard(fname):
             continue
         db_path = os.path.join(msg_dir, fname)
         try:
@@ -306,7 +318,7 @@ def find_contact(contacts, keyword):
     return None
 
 
-def get_messages(db_dir, username, my_name='我', other_name=None):
+def get_messages(db_dir, username, my_name='我', other_name=None, self_username=None):
     """读取某联系人的全部消息，按时间排序"""
     table = 'Msg_' + hashlib.md5(username.encode('utf-8')).hexdigest()
     msg_dir = os.path.join(db_dir, 'message')
@@ -321,7 +333,7 @@ def get_messages(db_dir, username, my_name='我', other_name=None):
                 for row in conn.execute('SELECT username, remark, nick_name FROM contact')
             }
     for fname in sorted(os.listdir(msg_dir)):
-        if not (fname.startswith('message_') and fname.endswith('.db')):
+        if not is_message_shard(fname):
             continue
         db_path = os.path.join(msg_dir, fname)
         try:
@@ -331,12 +343,15 @@ def get_messages(db_dir, username, my_name='我', other_name=None):
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
                 ).fetchone():
                     continue
+                required = {'local_id', 'local_type', 'real_sender_id', 'create_time', 'message_content'}
+                if not required.issubset({r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}):
+                    raise sqlite3.OperationalError('消息表缺少必要字段')
                 rows = conn.execute(
-                    f'SELECT local_id, local_type, real_sender_id, create_time, message_content '
+                    f'SELECT * '
                     f'FROM "{table}"'
                 ).fetchall()
                 sender_users = {}
-                if is_group and conn.execute(
+                if conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='Name2Id'"
                 ).fetchone():
                     sender_users = {
@@ -345,7 +360,7 @@ def get_messages(db_dir, username, my_name='我', other_name=None):
                     }
         except sqlite3.Error as e:
             raise RuntimeError(f'读取消息数据库失败: {db_path}') from e
-        self_id = detect_self_sender_id(db_path)
+        self_id, basis = detect_self_sender_id(db_path, self_username, with_basis=True)
         for r in rows:
             sender_id = r['real_sender_id']
             if sender_id == self_id:
@@ -359,6 +374,12 @@ def get_messages(db_dir, username, my_name='我', other_name=None):
             tname, text = parse_message(r['local_type'], r['message_content'])
             messages.append({
                 'local_id': r['local_id'],
+                'source_shard': fname,
+                'server_id': r['server_id'] if 'server_id' in r.keys() else 0,
+                'status': r['status'] if 'status' in r.keys() else None,
+                'sort_seq': r['sort_seq'] if 'sort_seq' in r.keys() else 0,
+                'sender_username': self_username if sender_id == self_id and self_username else sender_users.get(sender_id),
+                'identity_basis': basis,
                 'time': datetime.datetime.fromtimestamp(r['create_time']).strftime('%Y-%m-%d %H:%M:%S'),
                 'timestamp': r['create_time'],
                 'sender': sender,
@@ -366,8 +387,9 @@ def get_messages(db_dir, username, my_name='我', other_name=None):
                 'type': r['local_type'],
                 'type_name': tname,
                 'content': text,
+                '_raw_content': r['message_content'],
             })
-    messages.sort(key=lambda m: (m['timestamp'], m['local_id']))
+    messages.sort(key=lambda m: (m['timestamp'], m['sort_seq'] or 0, m['local_id'], m['source_shard']))
     return messages
 
 
@@ -400,11 +422,10 @@ def render_txt(display, messages):
 def render_json(contact, messages):
     """渲染 JSON 文本"""
     return json.dumps({
-        'contact': {'username': contact['username'], 'remark': contact.get('remark'),
-                    'nick_name': contact.get('nick_name')},
+        'contact': contact,
         'total': len(messages),
         'time_range': [messages[0]['time'], messages[-1]['time']] if messages else [],
-        'messages': messages,
+        'messages': [{k: v for k, v in m.items() if not k.startswith('_')} for m in messages],
     }, ensure_ascii=False, indent=2)
 
 

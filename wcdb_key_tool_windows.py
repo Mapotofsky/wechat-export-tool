@@ -829,45 +829,31 @@ def _decrypt_page(enc_key: bytes, page_data: bytes, pgno: int) -> bytes:
 
 
 def _decrypt_database(db_path: str, out_path: str, enc_key: bytes) -> bool:
-    file_size = os.path.getsize(db_path)
-    total_pages = file_size // PAGE_SZ
-    if file_size % PAGE_SZ != 0:
-        _print(f"  [WARN] 文件大小 {file_size} 不是 {PAGE_SZ} 的倍数")
-        total_pages += 1
-
-    with open(db_path, "rb") as fin:
-        page1 = fin.read(PAGE_SZ)
-    if len(page1) < PAGE_SZ:
-        _print("  [ERROR] 文件太小")
+    from pathlib import Path
+    import tempfile
+    from encrypted_sync import materialize, stable_files
+    source, target = Path(db_path).resolve(), Path(out_path).resolve()
+    if source == target:
+        raise ValueError('解密输出不能覆盖原始加密数据库')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    paths = [p for p in (source, Path(str(source) + '-wal')) if p.exists()]
+    try:
+        with tempfile.TemporaryDirectory(dir=target.parent) as tmp:
+            snapshot = Path(tmp) / 'source.db'
+            output = Path(tmp) / 'plain.db'
+            with stable_files(paths):
+                shutil.copyfile(source, snapshot)
+                if len(paths) == 2:
+                    shutil.copyfile(paths[1], Path(str(snapshot) + '-wal'))
+            result = materialize(snapshot, output, enc_key)
+            if Path(str(target) + '-wal').exists() or Path(str(target) + '-shm').exists():
+                raise ValueError('输出目录存在旧明文 WAL/SHM；请使用新的输出目录，原文件未删除')
+            output.replace(target)
+            _print(f"  已合并 {result['committed_frames']} 个提交 WAL 帧；真实微信 WAL 验证待执行")
+        return True
+    except (ValueError, RuntimeError, OSError) as exc:
+        _print(f'  [ERROR] {exc}')
         return False
-
-    salt = page1[:SALT_SZ]
-    mac_salt = bytes(b ^ 0x3A for b in salt)
-    mac_key = hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, 2, dklen=KEY_SZ)
-    p1_hmac_data = page1[SALT_SZ: PAGE_SZ - RESERVE_SZ + IV_SZ]
-    p1_stored_hmac = page1[PAGE_SZ - HMAC_SZ: PAGE_SZ]
-    hm = hmac_mod.new(mac_key, p1_hmac_data, hashlib.sha512)
-    hm.update(struct.pack("<I", 1))
-    if hm.digest() != p1_stored_hmac:
-        _print(f"  [ERROR] Page 1 HMAC 验证失败! salt: {salt.hex()}")
-        return False
-
-    _print(f"  HMAC OK, {total_pages} pages")
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-
-    with open(db_path, "rb") as fin, open(out_path, "wb") as fout:
-        for pgno in range(1, total_pages + 1):
-            page = fin.read(PAGE_SZ)
-            if len(page) < PAGE_SZ:
-                if len(page) > 0:
-                    page = page + b"\x00" * (PAGE_SZ - len(page))
-                else:
-                    break
-            fout.write(_decrypt_page(enc_key, page, pgno))
-            if pgno % 10000 == 0:
-                _print(f"  进度: {pgno}/{total_pages} ({100 * pgno / total_pages:.1f}%)")
-
-    return True
 
 
 def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
@@ -894,17 +880,15 @@ def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
                 db_files.append((rel, path, os.path.getsize(path)))
     db_files.sort(key=lambda x: x[2])
     _print(f"找到 {len(db_files)} 个数据库文件\n")
-    # ---------- custom add start ----------
-    ignored_wals = [
+    wals = [
         rel + "-wal" for rel, path, _sz in db_files
         if os.path.exists(path + "-wal") and os.path.getsize(path + "-wal") > 0
     ]
-    if ignored_wals:
+    if wals:
         _print(
-            f"[WARN] 检测到 {len(ignored_wals)} 个非空加密 WAL；当前仅解密 .db 主文件，"
-            "未写回主库的最新消息可能缺失"
+            f"检测到 {len(wals)} 个非空加密 WAL，将验证提交帧与页面 HMAC 后合并；"
+            "快照期间取得 SQLite 事务锁，可保持微信打开。此实现尚未完成真实微信加密 WAL 验证。"
         )
-    # ---------- custom add end ----------
 
     success = failed = 0
     total_bytes = 0
@@ -923,7 +907,7 @@ def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
                 conn = sqlite3.connect(out_path)
                 tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
                 conn.close()
-                _print(f"  OK! 表: {', '.join(t[0] for t in tables[:5])}")
+                _print(f"  OK! {len(tables)} 个表")
                 success += 1
                 total_bytes += sz
             except Exception as e:
@@ -938,7 +922,7 @@ def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
     # ---------- custom modify start ----------
     return {
         "success": success, "failed": failed, "total": len(db_files),
-        "total_bytes": total_bytes, "ignored_wals": ignored_wals,
+        "total_bytes": total_bytes, "wal_files": wals, "real_wechat_wal_validation": "not_performed",
     }
     # ---------- custom modify end ----------
 

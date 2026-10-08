@@ -1,4 +1,12 @@
+# 必需依赖：在运行 run.py 的 Python 环境中安装。
+# 安装命令：python -m pip install -r requirements.txt
+# 本机网页 API 服务
 fastapi>=0.110
+# HTTP 服务与文件监听等运行支持
 uvicorn[standard]>=0.29
+# 解压微信消息中的 Zstandard 内容
 zstandard>=0.22
-python-multipart>=0.0.9
+# 网页请求参数校验
+pydantic>=2,<3
+# 本机请求 Host 校验中间件
+starlette>=0.36

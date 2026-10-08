@@ -1,0 +1,11 @@
+# 可选依赖：只有使用语音转写时才需要。
+# 在 voice_service.py 的 PYTHON 指向的解释器中安装：
+# <识别解释器> -m pip install -r requirements-voice.txt
+# 本地语音识别；会依赖 PyTorch，GPU 版本按设备另行选择。
+openai-whisper
+# 识别音频的数组处理
+numpy
+# 将微信 SILK 语音解码为 PCM
+pilk
+# 提供 FFmpeg 可执行文件，用于音频转换
+imageio-ffmpeg

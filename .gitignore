@@ -2,3 +2,4 @@ all_keys.json
 decrypted/
 exports/
 *__pycache__/
+local_data/
