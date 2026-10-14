@@ -3,3 +3,4 @@ decrypted/
 exports/
 *__pycache__/
 local_data/
+*performance_results/

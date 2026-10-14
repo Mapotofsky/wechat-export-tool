@@ -124,6 +124,7 @@ class Manager:
             archive = self.archive()
             if info['mode'] == 'plaintext':
                 archive.save_config({'decrypted_dir': info['directory']})
+                archive.prepare_directory(info['directory'])
             return account
 
     def status(self):
@@ -148,22 +149,37 @@ class Manager:
                 raise ValueError('已有维护任务正在执行，可继续查看列表和导出')
             account = dict(self.account() or {})
             archive = self.archive(account)
+            if action == 'update' and usernames is None:
+                usernames = archive.config().get('followed_usernames', [])
+            usernames = list(dict.fromkeys(usernames or []))
+            if action in ('update', 'transcribe') and not usernames:
+                raise ValueError('处理范围为空；请先保存关注会话或明确选择会话')
+            if action == 'transcribe' and set(usernames) - {r['username'] for r in archive.contacts()}:
+                raise ValueError('所选会话尚未导入；请先导入所选会话')
             task = {'id': uuid.uuid4().hex, 'account_id': account['id'], 'action': action,
                     'status': 'running', 'stage': '准备', 'done': 0, 'total': 0, 'started': now(),
-                    'next_step': '', 'reason': ''}
+                    'next_step': '', 'reason': '', 'selected_usernames': usernames, 'selected_count': len(usernames),
+                    'scope': 'all' if action == 'update_all' else 'selected'}
             self.task = task
             atomic_json(archive.directory / 'task.json', task)
-            self.executor.submit(self.perform, account, archive, task, action, usernames or [])
+            self.executor.submit(self.perform, account, archive, task, action, usernames)
             return dict(task)
 
     def perform(self, account, archive, task, action, usernames):
         task_path = archive.directory / 'task.json'
+        last_publication = 0.
         def progress(stage, done=0, total=0):
+            nonlocal last_publication
             with self.lock:
+                if action in ('update', 'update_all', 'transcribe'):
+                    stage += ' · 全部会话' if action == 'update_all' else f' · 已选 {len(usernames)} 个会话'
                 task.update(stage=stage, done=done, total=total)
-                atomic_json(task_path, task)
+                if time.monotonic() - last_publication >= .5:
+                    atomic_json(task_path, task)
+                    last_publication = time.monotonic()
         try:
             config = archive.config()
+            manifest = {}
             if action == 'extract':
                 if account['mode'] != 'encrypted':
                     raise ValueError('此目录已是明文数据库，无需提取密钥')
@@ -177,26 +193,49 @@ class Manager:
                     raise RuntimeError('密钥提取失败。请确认微信已登录且当前进程有读取权限，必要时以管理员身份启动后重试')
                 archive.save_config({'keys_file': str(keys)})
                 result = {'keys_saved': True}
-            elif action in ('prepare', 'update'):
+            elif action in ('prepare', 'discover', 'update', 'update_all'):
                 db_dir = config.get('decrypted_dir')
                 manifest = {}
                 if account['mode'] == 'encrypted':
                     if not config.get('keys_file'):
                         raise ValueError('请先点击提取密钥，或设置已有的本账号密钥文件')
+                    with closing(archive.connect()) as c:
+                        media_needed = action in ('update', 'update_all') and bool(c.execute(
+                            "SELECT 1 FROM transcripts WHERE status='success' AND (? OR username IN (SELECT value FROM json_each(?))) LIMIT 1",
+                            (action == 'update_all', json.dumps(usernames))).fetchone())
                     db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
-                                                          config['keys_file'], db_dir, progress)
-                if action == 'prepare':
+                                                          config['keys_file'], [db_dir, config.get('message_snapshot'), config.get('media_snapshot')], progress,
+                                                          contacts_only=action == 'prepare', media=media_needed)
+                if action in ('prepare', 'discover'):
                     archive.save_config({'decrypted_dir': str(db_dir)})
+                    if account['mode'] == 'encrypted':
+                        snapshot = db_dir if action == 'discover' else config.get('message_snapshot') or config.get('decrypted_dir')
+                        if snapshot:
+                            archive.save_config({'message_snapshot': str(snapshot)})
+                    count = archive.prepare_directory(db_dir, discover=action == 'discover')
                     result = {'prepared': True, 'databases': len(manifest),
-                              'next_step': '查找并确认自己的内部 username，再点击更新聊天数据'}
+                              'contacts': count, 'next_step': '选择并保存关注会话，确认身份后更新关注'}
                 else:
                     if not config.get('self_username'):
                         raise ValueError('请先查找并确认自己的内部 username')
-                    result = archive.update(db_dir, progress, settings={'decrypted_dir': str(db_dir)})
+                    published = {'decrypted_dir': str(db_dir)}
+                    if account['mode'] == 'encrypted':
+                        published['message_snapshot'] = str(db_dir)
+                        if media_needed:
+                            published['media_snapshot'] = str(db_dir)
+                    result = archive.update(db_dir, progress, settings=published,
+                                            signatures=manifest if account['mode'] == 'encrypted' else None,
+                                            usernames=None if action == 'update_all' else usernames)
                     result['decrypted_reused'] = sum(x['reused'] for x in manifest.values())
             elif action == 'transcribe':
                 if not usernames:
                     raise ValueError('请先选择聊天')
+                if account['mode'] == 'encrypted':
+                    db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
+                        config['keys_file'], [config.get('decrypted_dir'), config.get('media_snapshot')], progress, contacts_only=True, media=True)
+                    archive.save_config({'decrypted_dir': str(db_dir), 'media_snapshot': str(db_dir),
+                                         'message_snapshot': config.get('message_snapshot') or config.get('decrypted_dir')})
+                    config['decrypted_dir'] = str(db_dir)
                 progress('检查本地识别工具')
                 info = voice_service.probe()
                 model = config.get('asr_model') or next((m for m in info.get('models', []) if Path(m).name == 'small.pt'), '')
@@ -210,6 +249,12 @@ class Manager:
                 result = voice_service.transcribe(archive, config['decrypted_dir'], usernames, model, progress, recognizer)
             else:
                 raise ValueError('未知任务')
+            if manifest:
+                result['preparation'] = {
+                    'snapshot_seconds': sum(x.get('snapshot_seconds', 0) for x in manifest.values()),
+                    'prepare_seconds': sum(x.get('prepare_seconds', 0) for x in manifest.values()),
+                    'snapshot_bytes': sum(x.get('snapshot_bytes', 0) for x in manifest.values()),
+                    'materialized_bytes': sum(x.get('source_bytes', 0) for x in manifest.values() if not x['reused'])}
             with self.lock:
                 task.update(status='success', stage='完成', result=result, finished=now(), next_step=result.get('next_step', '可查看列表或导出'))
         except BaseException as exc:

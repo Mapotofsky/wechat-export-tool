@@ -203,7 +203,7 @@ class MaintenanceTests(unittest.TestCase):
             release.wait(5)
             return original(archive, *args, **kwargs)
         with patch.object(Archive, 'update', slow_update):
-            manager.submit('update')
+            manager.submit('update', [self.username])
             self.assertTrue(entered.wait(5))
             self.assertEqual(manager.status()['task']['status'], 'running')
             self.assertEqual(manager.archive().contacts(), [])
@@ -319,9 +319,9 @@ class MaintenanceTests(unittest.TestCase):
         manager.archive().save_config({'self_username': 'wxid_self'})
         manager.archive().update(self.source)
         with patch.object(web, 'manager', manager):
-            self.assertEqual([r['username'] for r in web.contacts(sort='recent')], [friend, self.username])
-            self.assertEqual([r['username'] for r in web.contacts(sort='count')], [self.username, friend])
-            self.assertEqual([r['username'] for r in web.contacts(category='friend')], [friend])
+            self.assertEqual([r['username'] for r in web.contacts(sort='recent') if r['imported']], [friend, self.username])
+            self.assertEqual([r['username'] for r in web.contacts(sort='count') if r['imported']], [self.username, friend])
+            self.assertEqual([r['username'] for r in web.contacts(category='friend') if r['imported']], [friend])
         with closing(sqlite3.connect(self.source / 'message' / 'message_1.db')) as c, c:
             c.execute(f'UPDATE "{table(friend)}" SET message_content=?,local_type=10000', ('对方撤回了一条消息',))
         manager.archive().update(self.source)

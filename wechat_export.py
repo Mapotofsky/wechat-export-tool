@@ -13,7 +13,9 @@ import html
 import sqlite3
 import hashlib
 import datetime
-from contextlib import closing
+from contextlib import closing, nullcontext, ExitStack
+import heapq
+from pathlib import Path
 from collections import Counter
 
 try:
@@ -188,7 +190,7 @@ def classify_username(username):
 _SELF_ID_CACHE = {}
 
 
-def detect_self_sender_id(db_path, self_username=None, with_basis=False):
+def detect_self_sender_id(db_path, self_username=None, with_basis=False, connection=None):
     """确定某个 message 分片里"自己"的 real_sender_id。
 
     优先使用 filehelper 中唯一的非系统消息发送者；然后查询该分片
@@ -197,7 +199,7 @@ def detect_self_sender_id(db_path, self_username=None, with_basis=False):
     """
     self_id = None
     basis = 'heuristic_1'
-    with closing(_connect_ro(db_path)) as conn:
+    with closing(_connect_ro(db_path)) if connection is None else nullcontext(connection) as conn:
         cur = conn.cursor()
         # 锚点1：filehelper 表，消息全部是"自己"发的
         fh = 'Msg_' + hashlib.md5(b'filehelper').hexdigest()
@@ -318,79 +320,78 @@ def find_contact(contacts, keyword):
     return None
 
 
-def get_messages(db_dir, username, my_name='我', other_name=None, self_username=None):
-    """读取某联系人的全部消息，按时间排序"""
-    table = 'Msg_' + hashlib.md5(username.encode('utf-8')).hexdigest()
-    msg_dir = os.path.join(db_dir, 'message')
-    messages = []
-    is_group = username.endswith('@chatroom')
-    contact_names = {}
-    contact_db = os.path.join(db_dir, 'contact', 'contact.db')
-    if is_group and os.path.exists(contact_db):
-        with closing(_connect_ro(contact_db)) as conn:
-            contact_names = {
-                row[0]: row[1] or row[2] or row[0]
-                for row in conn.execute('SELECT username, remark, nick_name FROM contact')
-            }
-    for fname in sorted(os.listdir(msg_dir)):
-        if not is_message_shard(fname):
-            continue
-        db_path = os.path.join(msg_dir, fname)
+class MessageReader:
+    """One import's read transactions and identity/contact caches; bounded row iteration."""
+    def __init__(self, db_dir, self_username=None):
+        self.db_dir = Path(db_dir)
+        self.self_username = self_username
+        self.stack = ExitStack()
+        self.shards = {}
+        self.names = {}
+
+    def __enter__(self):
         try:
-            with closing(_connect_ro(db_path)) as conn:
-                conn.row_factory = sqlite3.Row
-                if not conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-                ).fetchone():
+            contact = self.db_dir / 'contact' / 'contact.db'
+            if contact.exists():
+                c = self.stack.enter_context(closing(_connect_ro(str(contact))))
+                c.execute('BEGIN')
+                self.names = {u: r or n or u for u, r, n in c.execute('SELECT username,remark,nick_name FROM contact')}
+            for path in sorted((self.db_dir / 'message').glob('message_*.db')):
+                if not is_message_shard(path.name):
                     continue
-                required = {'local_id', 'local_type', 'real_sender_id', 'create_time', 'message_content'}
-                if not required.issubset({r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}):
-                    raise sqlite3.OperationalError('消息表缺少必要字段')
-                rows = conn.execute(
-                    f'SELECT * '
-                    f'FROM "{table}"'
-                ).fetchall()
-                sender_users = {}
-                if conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='Name2Id'"
-                ).fetchone():
-                    sender_users = {
-                        row[0]: row[1]
-                        for row in conn.execute('SELECT rowid, user_name FROM Name2Id')
-                    }
-        except sqlite3.Error as e:
-            raise RuntimeError(f'读取消息数据库失败: {db_path}') from e
-        self_id, basis = detect_self_sender_id(db_path, self_username, with_basis=True)
-        for r in rows:
-            sender_id = r['real_sender_id']
-            if sender_id == self_id:
-                sender = my_name
-            elif is_group:
-                sender_user = sender_users.get(sender_id)
-                sender = (contact_names.get(sender_user) or sender_user
-                          or f'未知发送者#{sender_id}')
-            else:
-                sender = other_name or '对方'
-            tname, text = parse_message(r['local_type'], r['message_content'])
-            messages.append({
-                'local_id': r['local_id'],
-                'source_shard': fname,
-                'server_id': r['server_id'] if 'server_id' in r.keys() else 0,
-                'status': r['status'] if 'status' in r.keys() else None,
-                'sort_seq': r['sort_seq'] if 'sort_seq' in r.keys() else 0,
-                'sender_username': self_username if sender_id == self_id and self_username else sender_users.get(sender_id),
-                'identity_basis': basis,
-                'time': datetime.datetime.fromtimestamp(r['create_time']).strftime('%Y-%m-%d %H:%M:%S'),
-                'timestamp': r['create_time'],
-                'sender': sender,
-                'sender_id': r['real_sender_id'],
-                'type': r['local_type'],
-                'type_name': tname,
-                'content': text,
-                '_raw_content': r['message_content'],
-            })
-    messages.sort(key=lambda m: (m['timestamp'], m['sort_seq'] or 0, m['local_id'], m['source_shard']))
-    return messages
+                c = self.stack.enter_context(closing(_connect_ro(str(path))))
+                c.row_factory = sqlite3.Row
+                c.execute('PRAGMA temp_store=FILE')
+                c.execute('BEGIN')
+                tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                users = {r[0]: r[1] for r in c.execute('SELECT rowid,user_name FROM Name2Id')} if 'Name2Id' in tables else {}
+                identity = detect_self_sender_id(str(path), self.self_username, True, c)
+                self.shards[path.name] = (c, tables, users, identity)
+            return self
+        except BaseException:
+            self.stack.close()
+            raise
+
+    def __exit__(self, *exc):
+        return self.stack.__exit__(*exc)
+
+    def iter_messages(self, username, my_name='我', other_name=None, shards=None, parse=True):
+        table = 'Msg_' + hashlib.md5(username.encode()).hexdigest()
+        def rows(fname, state):
+            c, tables, users, (self_id, basis) = state
+            if table not in tables:
+                return
+            columns = {r[1] for r in c.execute(f'PRAGMA table_info("{table}")')}
+            if not {'local_id', 'local_type', 'real_sender_id', 'create_time', 'message_content'}.issubset(columns):
+                raise sqlite3.OperationalError('消息表缺少必要字段')
+            seq = 'COALESCE(sort_seq,0)' if 'sort_seq' in columns else '0+0'
+            cursor = c.execute(f'SELECT * FROM "{table}" ORDER BY create_time,{seq},local_id')
+            while batch := cursor.fetchmany(512):
+                for r in batch:
+                    sender_id = r['real_sender_id']
+                    user = self.self_username if sender_id == self_id and self.self_username else users.get(sender_id)
+                    sender = my_name if sender_id == self_id else (
+                        self.names.get(user) or user or f'未知发送者#{sender_id}'
+                        if username.endswith('@chatroom') else other_name or '对方')
+                    tname, text = parse_message(r['local_type'], r['message_content']) if parse else (None, None)
+                    yield {'local_id': r['local_id'], 'source_shard': fname,
+                           'server_id': r['server_id'] if 'server_id' in columns else 0,
+                           'status': r['status'] if 'status' in columns else None,
+                           'sort_seq': r['sort_seq'] if 'sort_seq' in columns else 0,
+                           'sender_username': user, 'identity_basis': basis,
+                           'time': datetime.datetime.fromtimestamp(r['create_time']).strftime('%Y-%m-%d %H:%M:%S'),
+                           'timestamp': r['create_time'], 'sender': sender, 'sender_id': sender_id,
+                           'type': r['local_type'], 'type_name': tname, 'content': text,
+                           '_raw_content': r['message_content']}
+        streams = [rows(fname, state) for fname, state in self.shards.items() if shards is None or fname in shards]
+        return heapq.merge(*streams, key=lambda m: (m['timestamp'], m['sort_seq'] or 0, m['local_id'], m['source_shard']))
+
+
+def get_messages(db_dir, username, my_name='我', other_name=None, self_username=None):
+    with MessageReader(db_dir, self_username) as reader:
+        return list(reader.iter_messages(username, my_name, other_name))
+
+
 
 
 def _safe_name(name):

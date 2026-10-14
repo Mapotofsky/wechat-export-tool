@@ -61,7 +61,11 @@ class SettingsReq(BaseModel):
 
 class TaskReq(BaseModel):
     action: str
-    usernames: list[str] = []
+    usernames: list[str] | None = None
+
+
+class FollowReq(BaseModel):
+    usernames: list[str]
 
 
 class ExportReq(BaseModel):
@@ -127,15 +131,23 @@ def settings(req: SettingsReq):
 
 @app.post('/api/tasks')
 def task(req: TaskReq):
-    if req.action not in ('extract', 'prepare', 'update', 'transcribe'):
+    if req.action not in ('extract', 'prepare', 'discover', 'update', 'update_all', 'transcribe'):
         raise ValueError('未知任务')
-    return manager.submit(req.action, list(dict.fromkeys(req.usernames)))
+    return manager.submit(req.action, None if req.usernames is None else list(dict.fromkeys(req.usernames)))
+
+
+@app.post('/api/followed')
+def followed(req: FollowReq):
+    if manager.busy():
+        raise ValueError('请等待当前任务完成后保存关注范围')
+    manager.archive().save_config({'followed_usernames': list(dict.fromkeys(req.usernames))})
+    return {'saved': True}
 
 
 @app.get('/api/contacts')
 def contacts(q: str = '', category: str = '', start: int | None = None, end: int | None = None,
              sort: str = 'recent'):
-    rows = manager.archive().contacts() if manager.account() else []
+    rows = manager.archive().directory_contacts() if manager.account() else []
     q = q.casefold()
     rows = [r for r in rows if (not q or q in r['name'].casefold() or q in r['username'].casefold())
             and (not category or r['category'] == category)
@@ -165,6 +177,8 @@ def export(req: ExportReq):
 
 def export_snapshot(req, archive, connection):
     available = {c['username']: c for c in archive.contacts(connection)}
+    if set(req.usernames) - available.keys():
+        raise ValueError('所选会话尚未导入；请先导入所选会话')
     selected = [available[u] for u in dict.fromkeys(req.usernames) if u in available]
     if not selected:
         raise ValueError('未选择有效聊天')

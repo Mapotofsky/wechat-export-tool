@@ -44,6 +44,9 @@ class WebHttpTests(unittest.TestCase):
         candidate = api('identity-candidates', {'query': 'public_id'})[0]
         self.assertEqual(candidate['username'], 'wxid_self')
         api('settings', {'self_username': candidate['username'], 'confirmed': True})
+        directory = api('contacts')
+        self.assertTrue(any(r['username'] == 'test@chatroom' and not r['imported'] for r in directory))
+        api('followed', {'usernames': ['test@chatroom']})
         api('tasks', {'action': 'update'})
         for _ in range(100):
             status = api('data-status')

@@ -212,21 +212,25 @@ def file_digest(path):
     return digest.hexdigest()
 
 
-def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: None):
+def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: None, contacts_only=False, media=False):
     source, account_dir = Path(source), Path(account_dir)
     keys = cipher._strip_key_metadata(json.loads(Path(keys_file).read_text(encoding='utf-8')))
     files = sorted([source / 'contact' / 'contact.db'] +
-                   [p for p in (source / 'message').glob('message_*.db') if is_message_shard(p.name)] +
-                   list((source / 'message').glob('media_*.db')))
+                   ([] if contacts_only else [p for p in (source / 'message').glob('message_*.db') if is_message_shard(p.name)]) +
+                   (list((source / 'message').glob('media_*.db')) if media else []))
     if not files or not files[0].exists() or not list((source / 'message').glob('message_*.db')):
         raise ValueError('目录需要包含 contact/contact.db 与 message/message_*.db')
     generation = account_dir / 'decrypted' / uuid.uuid4().hex
     generation.mkdir(parents=True)
-    manifest, old = {}, {}
-    if previous and (Path(previous) / 'sync.json').exists():
-        old = json.loads((Path(previous) / 'sync.json').read_text(encoding='utf-8'))
+    manifest, reusable = {}, []
+    previous_dirs = previous if isinstance(previous, (list, tuple)) else [previous]
+    for directory in previous_dirs:
+        if directory and (Path(directory) / 'sync.json').exists():
+            reusable.append((Path(directory), json.loads((Path(directory) / 'sync.json').read_text(encoding='utf-8'))))
     paths = [p for db in files for p in (db, Path(str(db) + '-wal')) if p.exists()]
+    snapshot_started = time.perf_counter()
     with stable_files(paths):
+        snapshot_bytes = sum(p.stat().st_size for p in paths)
         # Copy main databases and WALs while all snapshot locks remain held.
         snapshot = generation / 'source_snapshot'
         for index, db in enumerate(files):
@@ -238,7 +242,9 @@ def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: N
             wal = Path(str(db) + '-wal')
             if wal.exists():
                 shutil.copyfile(wal, Path(str(dst) + '-wal'))
+    snapshot_seconds = time.perf_counter() - snapshot_started
     for index, db in enumerate(files):
+        file_started = time.perf_counter()
         progress('解密与 WAL 合并（真实验证待执行）', index, len(files))
         rel = db.relative_to(source)
         src, dst = snapshot / rel, generation / rel
@@ -252,13 +258,19 @@ def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: N
         with src.open('rb') as f:
             if not cipher.verify_enc_key(key, f.read(cipher.PAGE_SZ)):
                 raise ValueError('当前密钥不匹配此账号的数据库，请重新提取')
-        if old.get(str(rel), {}).get('signature') == signature and (Path(previous) / rel).exists():
+        cached = next(((directory, old[str(rel)]) for directory, old in reusable
+                       if old.get(str(rel), {}).get('signature') == signature and (directory / rel).exists()), None)
+        if cached:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(Path(previous) / rel, dst)
-            info = dict(old[str(rel)], reused=True)
+            shutil.copyfile(cached[0] / rel, dst)
+            info = dict(cached[1], reused=True)
         else:
             info = dict(materialize(src, dst, key, progress), signature=signature, reused=False)
         manifest[str(rel)] = info
+        info.update(prepare_seconds=time.perf_counter() - file_started,
+                    source_bytes=src.stat().st_size + (wal.stat().st_size if wal.exists() else 0),
+                    snapshot_seconds=snapshot_seconds if index == 0 else 0,
+                    snapshot_bytes=snapshot_bytes if index == 0 else 0)
         # These are new, private staging copies, not user-owned source/decrypted files.
         src.unlink()
         if wal.exists():
