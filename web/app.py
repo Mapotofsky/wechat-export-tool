@@ -20,6 +20,7 @@ import wechat_export as we
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_DIR = ROOT / 'decrypted'
+DB_SUGGESTION_EXPLICIT = False
 manager = Manager(ROOT / 'local_data')
 app = FastAPI(title='微信聊天档案', docs_url=None, redoc_url=None)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', 'testserver'])
@@ -71,6 +72,13 @@ class FollowReq(BaseModel):
 class ExportReq(BaseModel):
     usernames: list[str]
     format: str = 'zip'
+    start: int | None = None
+    end: int | None = None
+
+
+def validate_range(start, end):
+    if start is not None and end is not None and start > end:
+        raise ValueError('开始日期不能晚于结束日期')
 
 
 @app.get('/api/data-status')
@@ -88,7 +96,8 @@ def check_directory(req: DirectoryReq):
 @app.get('/api/suggest-directory')
 def suggest_directory():
     import wcdb_key_tool_windows as keys
-    return {'directory': keys.auto_detect_db_dir() or '', 'decrypted_default': str(DB_DIR)}
+    return {'directory': keys.auto_detect_db_dir() or '', 'decrypted_default': str(DB_DIR),
+            'explicit': DB_SUGGESTION_EXPLICIT}
 
 
 @app.post('/api/account')
@@ -146,20 +155,59 @@ def followed(req: FollowReq):
 
 @app.get('/api/contacts')
 def contacts(q: str = '', category: str = '', start: int | None = None, end: int | None = None,
-             sort: str = 'recent'):
+             sort: str = 'recent', date_mode: str = 'span', include_unknown: bool = False):
+    validate_range(start, end)
     rows = manager.archive().directory_contacts() if manager.account() else []
-    q = q.casefold()
-    rows = [r for r in rows if (not q or q in r['name'].casefold() or q in r['username'].casefold())
-            and (not category or r['category'] == category)
-            and (start is None or (r['first_timestamp'] is not None and r['first_timestamp'] >= start))
-            and (end is None or (r['last_timestamp'] is not None and r['last_timestamp'] <= end))]
+    q = q.strip().casefold()
+    fields = ('name', 'remark', 'nick_name', 'alias', 'username')
+    matches = {r['username']: r for r in rows if q and any(q in (r.get(k) or '').casefold() for k in fields)}
+    result = []
+    for r in rows:
+        reasons = []
+        if q:
+            if q in r['name'].casefold():
+                reasons.append('聊天名称命中')
+            if r['username'] in matches:
+                reasons.append('联系人命中：' + r['name'] + ' (' + r['username'] + ')')
+            if r['category'] == 'group':
+                for sender in r.get('recorded_senders', []):
+                    u = sender.get('username')
+                    if u in matches or q in (sender.get('name') or '').casefold() or q in (u or '').casefold():
+                        person = matches.get(u, sender)
+                        reasons.append('群关联命中（已收录发送者）：' + person['name'] + ' (' + (u or '身份未知') + ')')
+            if not reasons:
+                continue
+        if category and r['category'] != category:
+            continue
+        if start is not None or end is not None:
+            unknown = r['first_timestamp'] is None
+            if unknown:
+                if not include_unknown:
+                    continue
+            elif date_mode == 'activity':
+                if not manager.archive().message_count(r['username'], start, end):
+                    continue
+            elif ((start is not None and r['first_timestamp'] < start) or
+                  (end is not None and r['last_timestamp'] > end)):
+                continue
+        result.append(dict(r, match_reasons=reasons))
+    rows = result
     rows.sort(key=lambda r: (r['total'] if sort == 'count' else r['last_timestamp'] or 0, r['username']), reverse=True)
     return rows
 
 
 @app.get('/api/preview')
-def preview(username: str):
-    return manager.archive().messages(username, limit=5)
+def preview(username: str, start: int | None = None, end: int | None = None, offset: int = 0):
+    validate_range(start, end)
+    if offset < 0:
+        raise ValueError('分页位置不能小于零')
+    return manager.archive().messages(username, limit=5, start=start, end=end, offset=offset)
+
+
+@app.get('/api/message-count')
+def message_count(username: str, start: int | None = None, end: int | None = None):
+    validate_range(start, end)
+    return {'total': manager.archive().message_count(username, start, end)}
 
 
 def download(data, filename, media_type):
@@ -176,6 +224,7 @@ def export(req: ExportReq):
 
 
 def export_snapshot(req, archive, connection):
+    validate_range(req.start, req.end)
     available = {c['username']: c for c in archive.contacts(connection)}
     if set(req.usernames) - available.keys():
         raise ValueError('所选会话尚未导入；请先导入所选会话')
@@ -186,14 +235,16 @@ def export_snapshot(req, archive, connection):
         raise ValueError('格式必须为 txt、json 或 zip')
     if req.format != 'zip' and len(selected) == 1:
         contact = selected[0]
-        messages = archive.messages(contact['username'], connection)
+        messages = archive.messages(contact['username'], connection, start=req.start, end=req.end)
+        contact = dict(contact, total=len(messages), export_range={'start': req.start, 'end': req.end})
         content = we.render_txt(contact['name'], messages) if req.format == 'txt' else we.render_json(contact, messages)
         return download(content.encode('utf-8'), we.export_basename(contact) + '.' + req.format,
                         'text/plain; charset=utf-8' if req.format == 'txt' else 'application/json')
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
         for contact in selected:
-            messages = archive.messages(contact['username'], connection)
+            messages = archive.messages(contact['username'], connection, start=req.start, end=req.end)
+            contact = dict(contact, total=len(messages), export_range={'start': req.start, 'end': req.end})
             base = we.export_basename(contact)
             if req.format in ('zip', 'txt'):
                 zip_file.writestr(base + '_聊天记录.txt', we.render_txt(contact['name'], messages))

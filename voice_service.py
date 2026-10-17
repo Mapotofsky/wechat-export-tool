@@ -17,19 +17,19 @@ class ToolUnavailable(RuntimeError):
 
 def probe(python=PYTHON):
     if not Path(python).is_file():
-        return {'available': False, 'reason': '本地识别 Python 环境不存在', 'models': []}
+        return {'available': False, 'python': str(python), 'reason': f'语音解释器不存在：{python}。请检查 voice_service.py 中的 PYTHON 路径。', 'models': []}
     try:
         result = subprocess.run([str(python), str(WORKER), '--probe'], capture_output=True,
                                 text=True, encoding='utf-8', timeout=60)
         info = json.loads(result.stdout)
         info['python'] = str(python)
         if not info['available']:
-            info['reason'] = '需要本地 Whisper、已缓存模型和 ffmpeg'
+            info['reason'] = f'请在 "{python}" 中安装 requirements-voice.txt，并预先准备本地 .pt 模型与 ffmpeg；可运行 "{python}" local_asr.py --probe 检查'
         elif not info['silk']:
             info['reason'] = 'Whisper 可用；微信 SILK 语音仍需 pilk 解码包'
         return info
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return {'available': False, 'reason': '本地工具检查失败，可重新检查', 'models': []}
+        return {'available': False, 'python': str(python), 'reason': f'本地工具检查失败。请运行 "{python}" local_asr.py --probe 检查后重试', 'models': []}
 
 
 def find_media(db_dir, username, message):
@@ -61,7 +61,7 @@ def recognize(media, model, python=PYTHON):
         subprocess.run([str(python), str(WORKER), '--audio', str(source), '--model', str(model),
                         '--output', str(output)], capture_output=True, timeout=1800)
         if not output.exists():
-            raise RuntimeError('本地识别进程失败，请检查模型与运行环境')
+            raise RuntimeError(f'本地识别进程失败。请运行 "{python}" local_asr.py --probe 检查模型与环境')
         result = json.loads(output.read_text(encoding='utf-8'))
         if result['status'] != 'success' or not result.get('text'):
             raise RuntimeError(result.get('reason', '未识别到语音文本'))

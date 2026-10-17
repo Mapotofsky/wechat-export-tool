@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.request
 import webbrowser
+import sys
 
 
 ROOT = Path(__file__).resolve().parent
@@ -44,6 +45,7 @@ def main(argv=None):
     web_cmd.add_argument('--open-browser', action='store_true', help='服务就绪后自动打开浏览器')
 
     args = parser.parse_args(argv)
+    print(f'使用解释器：{sys.executable}')
     try:
         if args.command == 'web':
             if not 1 <= args.port <= 65535:
@@ -56,6 +58,8 @@ def main(argv=None):
             if not web_app.we.HAS_ZSTD:
                 raise RuntimeError('缺少 zstandard。请运行：python -m pip install -r requirements.txt')
             web_app.DB_DIR = args.db.resolve()
+            raw_args = sys.argv[1:] if argv is None else argv
+            web_app.DB_SUGGESTION_EXPLICIT = any(a == '--db' or a.startswith('--db=') for a in raw_args)
             print(f'请在浏览器打开 http://127.0.0.1:{args.port}')
             if args.open_browser:
                 def open_when_ready():
@@ -102,7 +106,7 @@ def main(argv=None):
             result = export_contact(str(db_dir), contact, str(args.out), my_name=args.my_name)
             print(f"[{contact['name']}] {result['total']} 条 -> {result['txt']}，{result['json']}")
     except (ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
-        parser.exit(1, f'错误：{exc}\n')
+        parser.exit(1, f'错误：{exc}\n当前解释器：{sys.executable}\n依赖修复："{sys.executable}" -m pip install -r "{ROOT / "requirements.txt"}"\n')
 
 
 if __name__ == '__main__':

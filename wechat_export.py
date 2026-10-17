@@ -275,8 +275,10 @@ def load_contacts(db_dir, include_official=False, only_with_msg=True):
 
     conn = _connect_ro(contact_db)
     conn.row_factory = sqlite3.Row
+    columns = {r[1] for r in conn.execute('PRAGMA table_info(contact)')}
+    alias = 'alias' if 'alias' in columns else "'' AS alias"
     rows = conn.execute(
-        'SELECT username, local_type, remark, nick_name FROM contact'
+        f'SELECT username, local_type, remark, nick_name, {alias} FROM contact'
     ).fetchall()
     conn.close()
 
@@ -301,6 +303,7 @@ def load_contacts(db_dir, include_official=False, only_with_msg=True):
             'local_type': r['local_type'],
             'remark': r['remark'],
             'nick_name': r['nick_name'],
+            'alias': r['alias'],
             'name': name,
         })
     order = {'friend': 0, 'group': 1, 'openim': 2, 'official': 3}

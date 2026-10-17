@@ -78,7 +78,7 @@ class Archive:
                 preview='', recorded_senders=[], recorded_sender_count=0, imported=False)
                 for r in config.get('contact_directory', [])}
         for r in self.contacts():
-            rows[r['username']] = dict(r, imported=True)
+            rows[r['username']] = dict(rows.get(r['username'], {}), **r, imported=True)
         followed = set(config.get('followed_usernames', []))
         return [dict(r, followed=u in followed) for u, r in rows.items()]
 
@@ -106,17 +106,19 @@ class Archive:
             return 'server:' + str(message['server_id'])
         return f"local:{message['source_shard']}:{message['local_id']}:{message['timestamp']}"
 
-    def messages(self, username, connection=None, limit=None):
+    def messages(self, username, connection=None, limit=None, start=None, end=None, offset=0):
         if connection is None:
             with closing(self.connect()) as c:
-                return self.messages(username, c, limit)
+                return self.messages(username, c, limit, start, end, offset)
         result = []
         for key, data, status, text, reason, source in connection.execute('''
             SELECT m.message_key,m.data,t.status,t.text,t.reason,t.source FROM messages m
             LEFT JOIN transcripts t ON t.username=m.username AND t.message_key=m.message_key
-            WHERE m.username=? ORDER BY m.timestamp DESC,json_extract(m.data,'$.sort_seq') DESC,
+            WHERE m.username=? AND (? IS NULL OR m.timestamp>=?) AND (? IS NULL OR m.timestamp<=?)
+            ORDER BY m.timestamp DESC,json_extract(m.data,'$.sort_seq') DESC,
             json_extract(m.data,'$.local_id') DESC,m.message_key DESC''' +
-            (' LIMIT ?' if limit is not None else ''), (username, limit) if limit is not None else (username,)):
+            (' LIMIT ? OFFSET ?' if limit is not None else ''),
+            (username, start, start, end, end) + ((limit, offset) if limit is not None else ())):
             message = json.loads(data)
             message['message_id'] = key
             if (message['type'] & 0xffffffff) == 34:
@@ -126,6 +128,14 @@ class Archive:
                     message['content'] = text
             result.append(message)
         return list(reversed(result))
+
+    def message_count(self, username, start=None, end=None, connection=None):
+        if connection is None:
+            with closing(self.connect()) as c:
+                return self.message_count(username, start, end, c)
+        return connection.execute('''SELECT count(*) FROM messages WHERE username=?
+            AND (? IS NULL OR timestamp>=?) AND (? IS NULL OR timestamp<=?)''',
+            (username, start, start, end, end)).fetchone()[0]
 
     def metadata(self, c, username, contact, reuse=False):
         if reuse:
