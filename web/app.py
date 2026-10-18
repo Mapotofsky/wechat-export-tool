@@ -3,6 +3,7 @@
 import datetime
 import io
 import json
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 import zipfile
@@ -66,6 +67,7 @@ class SettingsReq(BaseModel):
 class TaskReq(BaseModel):
     action: str
     usernames: list[str] | None = None
+    group_id: str | None = None
 
 
 class FollowReq(BaseModel):
@@ -96,6 +98,7 @@ def save_view_state(req: ViewStateReq):
             raise ValueError('账号已切换，未保存旧账号阅读位置')
         if req.offset < 0 or req.scroll < 0:
             raise ValueError('阅读位置不能小于零')
+        manager.archive().require_visible([req.active])
         manager.archive().save_config({'view_state': req.model_dump(exclude={'account_id'})})
     return {'saved': True}
 
@@ -179,22 +182,87 @@ def settings(req: SettingsReq):
 def task(req: TaskReq):
     if req.action not in ('extract', 'prepare', 'discover', 'update', 'update_all', 'transcribe'):
         raise ValueError('未知任务')
-    return manager.submit(req.action, None if req.usernames is None else list(dict.fromkeys(req.usernames)))
+    return manager.submit(req.action, None if req.usernames is None else list(dict.fromkeys(req.usernames)), req.group_id)
 
 
 @app.post('/api/followed')
 def followed(req: FollowReq):
-    if manager.busy():
-        raise ValueError('请等待当前任务完成后保存关注范围')
-    manager.archive().save_config({'followed_usernames': list(dict.fromkeys(req.usernames))})
+    with manager.lock:
+        if manager.busy():
+            raise ValueError('请等待当前任务完成后保存关注范围')
+        manager.archive().save_config({'followed_usernames': list(dict.fromkeys(req.usernames))})
     return {'saved': True}
+
+
+class GroupReq(BaseModel):
+    id: str | None = None
+    name: str = ''
+    usernames: list[str] = Field(default_factory=list)
+    delete: bool = False
+
+
+@app.get('/api/groups')
+def groups():
+    return manager.archive().groups()
+
+
+@app.post('/api/groups')
+def save_group(req: GroupReq):
+    with manager.lock:
+        if manager.busy():
+            raise ValueError('请等待当前任务完成后编辑项目')
+        archive = manager.archive()
+        if req.id == 'followed':
+            if req.delete or req.name != '关注会话':
+                raise ValueError('关注会话为内置项目，不能删除或改名')
+            archive.save_config({'followed_usernames': list(dict.fromkeys(req.usernames))})
+            return {'saved': True, 'id': 'followed'}
+        existing = archive.config().get('session_groups', [])
+        if req.id and not any(g['id'] == req.id for g in existing):
+            raise ValueError('项目不存在，请重新加载')
+        name = req.name.strip()
+        if not req.delete and (not name or name in [g['name'] for g in archive.groups() if g['id'] != req.id]):
+            raise ValueError('请填写不重复的项目名称')
+        group_id = req.id or uuid.uuid4().hex
+        updated = [g for g in existing if g['id'] != group_id]
+        if not req.delete:
+            updated.append({'id': group_id, 'name': name, 'usernames': list(dict.fromkeys(req.usernames))})
+        archive.save_config({'session_groups': updated})
+        return {'saved': True, 'id': group_id}
+
+
+@app.get('/api/group-scope')
+def group_scope(group_id: str):
+    return manager.archive().group_scope(group_id)
+
+
+class HiddenReq(FollowReq):
+    hidden: bool = True
+    purge: bool = False
+
+
+@app.get('/api/hidden')
+def hidden_chats():
+    return [r for r in manager.archive().directory_contacts(include_hidden=True) if r['hidden']]
+
+
+@app.post('/api/hidden')
+def save_hidden(req: HiddenReq):
+    with manager.lock:
+        if manager.busy():
+            raise ValueError('请等待当前维护任务完成后隐藏、恢复或清理会话')
+        return manager.archive().set_hidden(req.usernames, req.hidden, req.purge)
 
 
 @app.get('/api/contacts')
 def contacts(q: str = '', category: str = '', start: int | None = None, end: int | None = None,
-             sort: str = 'recent', date_mode: str = 'span', include_unknown: bool = False):
+             sort: str = 'recent', date_mode: str = 'span', include_unknown: bool = False,
+             group_id: str = ''):
     validate_range(start, end)
     rows = manager.archive().directory_contacts() if manager.account() else []
+    if group_id:
+        members = {r['username'] for r in manager.archive().group_scope(group_id)['members']}
+        rows = [r for r in rows if r['username'] in members]
     q = q.strip().casefold()
     fields = ('name', 'remark', 'nick_name', 'alias', 'username')
     matches = {r['username']: r for r in rows if q and any(q in (r.get(k) or '').casefold() for k in fields)}
@@ -214,7 +282,7 @@ def contacts(q: str = '', category: str = '', start: int | None = None, end: int
                         reasons.append('群关联命中（已收录发送者）：' + person['name'] + ' (' + (u or '身份未知') + ')')
             if not reasons:
                 continue
-        if category and r['category'] != category:
+        if category and r['category'] not in category.split(','):
             continue
         if start is not None or end is not None:
             unknown = r['first_timestamp'] is None
@@ -235,6 +303,7 @@ def contacts(q: str = '', category: str = '', start: int | None = None, end: int
 
 @app.get('/api/preview')
 def preview(username: str, start: int | None = None, end: int | None = None, offset: int = 0):
+    manager.archive().require_visible([username])
     validate_range(start, end)
     if offset < 0:
         raise ValueError('分页位置不能小于零')
@@ -243,6 +312,7 @@ def preview(username: str, start: int | None = None, end: int | None = None, off
 
 @app.get('/api/message-count')
 def message_count(username: str, start: int | None = None, end: int | None = None):
+    manager.archive().require_visible([username])
     validate_range(start, end)
     return {'total': manager.archive().message_count(username, start, end)}
 
@@ -250,11 +320,14 @@ def message_count(username: str, start: int | None = None, end: int | None = Non
 @app.get('/api/messages')
 def messages(username: str, q: str = '', start: int | None = None, end: int | None = None,
              day: str | None = None, include_transcripts: bool = True, offset: int = 0, limit: int = 50):
-    return manager.archive().search(username, q, start, end, day, include_transcripts, offset, limit)
+    archive = manager.archive()
+    archive.require_visible([username])
+    return archive.search(username, q, start, end, day, include_transcripts, offset, limit)
 
 
 @app.get('/api/context')
 def context(username: str, message_id: str, before: int = 10, after: int = 10):
+    manager.archive().require_visible([username])
     return manager.archive().context(username, message_id, before, after)
 
 
@@ -298,13 +371,17 @@ def analysis_archive(account_id):
 
 @app.post('/api/analysis')
 def analyze(req: AnalysisReq):
-    return analysis.analyze(analysis_archive(req.account_id), req)
+    archive = analysis_archive(req.account_id)
+    archive.require_visible(req.usernames)
+    return analysis.analyze(archive, req)
 
 
 @app.post('/api/analysis/messages')
 def analyze_messages(req: AnalysisReq):
     validate_range(req.start, req.end)
-    return analysis.analysis_messages(analysis_archive(req.account_id), req)
+    archive = analysis_archive(req.account_id)
+    archive.require_visible(req.usernames)
+    return analysis.analysis_messages(archive, req)
 
 
 class BlockRule(BaseModel):
@@ -343,6 +420,7 @@ def export_search(req: SearchExportReq):
     if req.format not in ('txt', 'json', 'zip'):
         raise ValueError('格式必须为 txt、json 或 zip')
     archive = manager.archive()
+    archive.require_visible(req.usernames)
     with closing(archive.connect()) as connection:
         connection.execute('BEGIN')
         username = req.usernames[0]
@@ -377,6 +455,7 @@ def export(req: ExportReq):
 
 
 def export_snapshot(req, archive, connection):
+    archive.require_visible(req.usernames)
     validate_range(req.start, req.end)
     available = {c['username']: c for c in archive.contacts(connection)}
     if set(req.usernames) - available.keys():

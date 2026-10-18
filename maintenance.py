@@ -144,15 +144,23 @@ class Manager:
         return {'account': account, 'accounts': self.registry['accounts'], 'config': config,
                 'task': task, 'wal_validation': '尚未执行真实微信加密 WAL 端到端验证'}
 
-    def submit(self, action, usernames=None):
+    def submit(self, action, usernames=None, group_id=None):
         with self.lock:
             if self.busy():
                 raise ValueError('已有维护任务正在执行，可继续查看列表和导出')
             account = dict(self.account() or {})
             archive = self.archive(account)
+            if group_id is not None:
+                if action not in ('update', 'transcribe'):
+                    raise ValueError('此任务不支持项目范围')
+                usernames = [r['username'] for r in archive.group_scope(group_id)['members']]
             if action == 'update' and usernames is None:
                 usernames = archive.config().get('followed_usernames', [])
             usernames = list(dict.fromkeys(usernames or []))
+            if action in ('update', 'transcribe'):
+                # Hidden followed members keep their membership but never enter maintenance.
+                blocked = set(archive.config().get('hidden_usernames', []))
+                usernames = [u for u in usernames if u not in blocked]
             if action in ('update', 'transcribe') and not usernames:
                 raise ValueError('处理范围为空；请先保存关注会话或明确选择会话')
             if action == 'transcribe' and set(usernames) - {r['username'] for r in archive.contacts()}:

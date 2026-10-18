@@ -72,7 +72,7 @@ class Archive:
                 return self.contacts(c)
         return [json.loads(r[0]) for r in connection.execute('SELECT data FROM chats')]
 
-    def directory_contacts(self):
+    def directory_contacts(self, include_hidden=False):
         config = self.config()
         rows = {r['username']: dict(r, total=0, first_timestamp=None, last_timestamp=None,
                 preview='', recorded_senders=[], recorded_sender_count=0, imported=False)
@@ -80,7 +80,69 @@ class Archive:
         for r in self.contacts():
             rows[r['username']] = dict(rows.get(r['username'], {}), **r, imported=True)
         followed = set(config.get('followed_usernames', []))
-        return [dict(r, followed=u in followed) for u, r in rows.items()]
+        hidden = set(config.get('hidden_usernames', []))
+        return [dict(r, followed=u in followed, hidden=u in hidden) for u, r in rows.items()
+                if include_hidden or u not in hidden]
+
+    def require_visible(self, usernames):
+        if set(usernames) & set(self.config().get('hidden_usernames', [])):
+            raise ValueError('范围包含隐藏会话；请先在隐藏会话管理中恢复')
+
+    def groups(self):
+        config = self.config()
+        return [{'id': 'followed', 'name': '关注会话', 'usernames': config.get('followed_usernames', [])},
+                *config.get('session_groups', [])]
+
+    def group_scope(self, group_id):
+        group = next((g for g in self.groups() if g['id'] == group_id), None)
+        if group is None:
+            raise ValueError('项目不存在，请重新选择')
+        available = {r['username']: r for r in self.directory_contacts()}
+        members = [available[u] for u in dict.fromkeys(group['usernames']) if u in available]
+        return {'id': group_id, 'name': group['name'], 'members': members,
+                'imported': [r for r in members if r['imported']],
+                'pending': [r for r in members if not r['imported']]}
+
+    def set_hidden(self, usernames, hidden=True, purge=False):
+        config = self.config()
+        known = {r['username']: r for r in self.directory_contacts(include_hidden=True)}
+        if not usernames or set(usernames) - known.keys():
+            raise ValueError('请选择有效会话')
+        blocked = set(config.get('hidden_usernames', []))
+        blocked = blocked | set(usernames) if hidden else blocked - set(usernames)
+        values = {'hidden_usernames': sorted(blocked)}
+        # Keep names and membership when an archive-only historical chat is purged.
+        directory = {r['username']: r for r in config.get('contact_directory', [])}
+        for u in usernames:
+            directory.setdefault(u, {k: known[u].get(k, '') for k in
+                                     ('username', 'name', 'category', 'alias', 'remark', 'nick_name')})
+        values['contact_directory'] = list(directory.values())
+        if config.get('view_state', {}).get('active') in blocked:
+            values['view_state'] = {}
+        deleted = 0
+        with closing(self.connect()) as c:
+            with c:
+                if hidden and purge:
+                    for u in usernames:
+                        for table in ('messages', 'transcripts', 'locations', 'current_sources', 'chats'):
+                            count = c.execute(f'DELETE FROM {table} WHERE username=?', (u,)).rowcount
+                            if table == 'messages':
+                                deleted += count
+                    values['conversation_baselines'] = {u: b for u, b in config.get('conversation_baselines', {}).items()
+                                                        if u not in usernames}
+                c.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)',
+                              [(k, json.dumps(v, ensure_ascii=False)) for k, v in values.items()])
+            if hidden and purge:
+                try:
+                    c.execute('VACUUM')
+                    checkpoint = c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+                    reclaimed = checkpoint[0] == 0
+                except sqlite3.Error as exc:
+                    return {'saved': True, 'deleted_messages': deleted, 'space_reclaimed': False,
+                            'warning': f'档案已清理，但数据库空间回收未完成：{exc}；可稍后在隐藏会话管理中重试清理。'}
+            else:
+                reclaimed = False
+        return {'saved': True, 'deleted_messages': deleted, 'space_reclaimed': reclaimed}
 
     def prepare_directory(self, db_dir, discover=False):
         rows = {r['username']: r for r in self.config().get('contact_directory', [])}
@@ -330,6 +392,8 @@ class Archive:
         if selected is not None:
             contacts = [contact_details.get(u, {'username': u, 'name': reader.names.get(u, u),
                         'category': we.classify_username(u)}) for u in sorted(selected)]
+        hidden = set(config.get('hidden_usernames', []))
+        contacts = [r for r in contacts if r['username'] not in hidden]
         baselines = dict(config.get('conversation_baselines', {}))
         metrics['selected_chats'] = len(contacts)
         scanned_shards, skipped_shards = set(), set()
