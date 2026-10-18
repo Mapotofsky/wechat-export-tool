@@ -682,3 +682,50 @@ class Archive:
         with closing(self.connect()) as c:
             return c.execute('SELECT input,status,text FROM transcripts WHERE username=? AND message_key=?',
                              (username, key)).fetchone()
+
+    def record_transcript_error(self, username, key, reason):
+        with closing(self.connect()) as c, c:
+            c.execute('UPDATE transcripts SET reason=? WHERE username=? AND message_key=?', (reason, username, key))
+
+    def voice_targets(self, usernames, targets=None):
+        self.require_visible(usernames)
+        wanted = set((t['username'], t['message_id']) for t in targets) if targets is not None else None
+        result = []
+        with closing(self.connect()) as c:
+            for username in usernames:
+                for key, data in c.execute('''SELECT message_key,data FROM messages
+                        WHERE username=? AND (json_extract(data,'$.type') & 4294967295)=34
+                        ORDER BY timestamp,message_key''', (username,)):
+                    if wanted is None or (username, key) in wanted:
+                        result.append((username, dict(json.loads(data), message_id=key)))
+        if wanted is not None and (not wanted or wanted != {(u, m['message_id']) for u, m in result}):
+            raise ValueError('所选语音不存在或不在本次会话范围内，请刷新后重选')
+        return result
+
+    def voice_page(self, usernames, status='', q='', offset=0, limit=50):
+        self.require_visible(usernames)
+        if offset < 0 or not 1 <= limit <= 100:
+            raise ValueError('语音分页参数无效')
+        if status not in ('', 'success', 'not_requested', 'failed', 'media_missing', 'tool_unavailable'):
+            raise ValueError('未知转写状态')
+        if not usernames:
+            return {'messages': [], 'total': 0}
+        condition = f"m.username IN ({','.join('?' for _ in usernames)}) AND (json_extract(m.data,'$.type') & 4294967295)=34"
+        params = list(usernames)
+        if status:
+            condition += " AND coalesce(t.status,'not_requested')=?"
+            params.append(status)
+        if q:
+            condition += " AND (instr(lower(coalesce(t.text,'')),lower(?))>0 OR instr(lower(coalesce(json_extract(m.data,'$.sender'),'')),lower(?))>0)"
+            params.extend([q, q])
+        sql = ' FROM messages m LEFT JOIN transcripts t ON t.username=m.username AND t.message_key=m.message_key WHERE ' + condition
+        with closing(self.connect()) as c:
+            c.execute('BEGIN')
+            total = c.execute('SELECT count(*)' + sql, params).fetchone()[0]
+            rows = c.execute('SELECT m.username,m.message_key,m.data,t.status,t.text,t.reason,t.source' + sql +
+                             ' ORDER BY m.timestamp DESC,m.username,m.message_key DESC LIMIT ? OFFSET ?', params + [limit, offset])
+            messages = [dict(we.normalize_system_sender(json.loads(data)), username=u, message_id=key,
+                        transcription={'status': state or 'not_requested', 'text': text or '', 'reason': reason or '',
+                                       'media_source': json.loads(source) if source else None})
+                        for u, key, data, state, text, reason, source in rows]
+        return {'messages': messages, 'total': total}

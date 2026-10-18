@@ -190,7 +190,8 @@ def main(argv=None):
             def smoke():
                 result = subprocess.run([str(python_executable()), '-c',
                     'import sys,sqlite3,zstandard; print(sys.executable)'],
-                    capture_output=True, text=True, timeout=20)
+                    capture_output=True, text=True, timeout=20,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
                 (logs_root() / 'smoke-test.json').write_text(json.dumps({
                     'url': url, 'subprocess_returncode': result.returncode,
                     'subprocess_stdout': result.stdout, 'subprocess_stderr': result.stderr,

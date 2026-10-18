@@ -1,4 +1,4 @@
-"""Verify bundled CPU model loading, FFmpeg and Tencent SILK using synthetic speech."""
+"""Verify bundled automatic device selection, FFmpeg and SILK using synthetic speech."""
 import argparse
 import json
 from pathlib import Path
@@ -27,7 +27,7 @@ pilk.encode(str(pcm), str(silk), pcm_rate=24000, tencent=True)
 started = time.monotonic()
 result = {'capabilities': info, 'python': sys.executable, 'torch': torch.__version__,
           'cuda_compiled': torch.version.cuda, 'silk_header': silk.read_bytes()[:10].hex(),
-          'text': local_asr.recognize(silk, args.app.resolve().parent / 'models' / 'small.pt'),
+          'recognition': local_asr.recognize(silk, args.app.resolve().parent / 'models' / 'small.pt'),
           'seconds': round(time.monotonic() - started, 2)}
 (args.output / 'voice-probe.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
 print(json.dumps(result, ensure_ascii=False))

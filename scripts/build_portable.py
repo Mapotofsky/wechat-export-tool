@@ -143,6 +143,10 @@ def build(args):
         manifest = json.loads(manifest_file.read_text(encoding='utf-8'))
         manifest['program_files'] = list(PROGRAM_FILES)
         manifest['packages']['base'] = collect_licenses(destination / 'runtime', destination / 'licenses' / 'base')
+        if (destination / 'voice-runtime' / 'python.exe').is_file():
+            manifest['packages']['voice'] = collect_licenses(destination / 'voice-runtime', destination / 'licenses' / 'voice')
+            torch_version = next(p['version'] for p in manifest['packages']['voice'] if p['name'].lower() == 'torch')
+            manifest['flavor'] = 'voice-cuda' if '+cu' in torch_version else 'voice-cpu'
         for lock in ('requirements-desktop.lock', 'requirements-voice.lock'):
             shutil.copy2(ROOT / lock, destination / lock)
         manifest['files'] = release_files(destination)
@@ -175,8 +179,10 @@ def build(args):
     if args.voice:
         voice = destination / 'voice-runtime'
         prepare_runtime(voice, cache)
+        variant = 'cu121' if args.voice_device == 'cuda' else 'cpu'
+        run(voice / 'python.exe', '-m', 'pip', 'install', '--disable-pip-version-check', '--no-deps',
+            '--index-url', f'https://download.pytorch.org/whl/{variant}', f'torch==2.5.1+{variant}')
         run(voice / 'python.exe', '-m', 'pip', 'install', '--disable-pip-version-check',
-            '--extra-index-url', 'https://download.pytorch.org/whl/cpu',
             '-r', ROOT / 'requirements-voice.lock')
         packages['voice'] = collect_licenses(voice, licenses / 'voice')
         if not args.model or not args.model.is_file():
@@ -211,7 +217,7 @@ def build(args):
     (destination / '诊断启动.cmd').write_text(
         '@echo off\r\ncd /d "%~dp0"\r\n"%~dp0runtime\\python.exe" "%~dp0app\\desktop.py"\r\npause\r\n', encoding='utf-8')
     inventory = release_files(destination)
-    manifest = {'python': PYTHON_VERSION, 'python_source': PYTHON_URL, 'flavor': 'voice-cpu' if args.voice else 'base',
+    manifest = {'python': PYTHON_VERSION, 'python_source': PYTHON_URL, 'flavor': 'voice-' + args.voice_device if args.voice else 'base',
                 'program_files': list(PROGRAM_FILES), 'packages': packages, 'files': inventory,
                 'prerequisites': {name: {'source': url, 'bytes': (prerequisites / name).stat().st_size,
                     'product_version': windows_file_version(prerequisites / name)}
@@ -225,6 +231,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--cache', type=Path, default=ROOT / 'build-cache')
     parser.add_argument('--voice', action='store_true')
+    parser.add_argument('--voice-device', choices=('cuda', 'cpu'), default='cuda', help='语音包默认包含 CUDA 12.1 运行时，无可用 GPU 时自动使用 CPU')
     parser.add_argument('--model', type=Path)
     parser.add_argument('--prerequisites', action='store_true', help='随包附带微软 WebView2/.NET 离线安装器')
     parser.add_argument('--resources-only', action='store_true', help='仅更新已有包的程序和静态资源，不改变运行时依赖')

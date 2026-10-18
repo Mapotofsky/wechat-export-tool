@@ -62,12 +62,22 @@ class SettingsReq(BaseModel):
     confirmed: bool = False
     keys_file: str | None = None
     asr_model: str | None = None
+    asr_provider: Literal['local', 'openai', 'dashscope'] | None = None
+    asr_api_url: str | None = None
+    asr_api_model: str | None = None
+    asr_api_key: str | None = None
+
+
+class VoiceTarget(BaseModel):
+    username: str
+    message_id: str
 
 
 class TaskReq(BaseModel):
     action: str
     usernames: list[str] | None = None
     group_id: str | None = None
+    voice_targets: list[VoiceTarget] | None = None
 
 
 class FollowReq(BaseModel):
@@ -171,9 +181,15 @@ def settings(req: SettingsReq):
         values['keys_file'] = str(path)
     if req.asr_model is not None:
         path = Path(req.asr_model).expanduser().resolve()
-        if not path.is_file() or path.suffix != '.pt':
+        if req.asr_model and (not path.is_file() or path.suffix != '.pt'):
             raise ValueError('请选择已缓存的本地 Whisper .pt 模型文件')
-        values['asr_model'] = str(path)
+        values['asr_model'] = str(path) if req.asr_model else ''
+    for name in ('asr_provider', 'asr_api_url', 'asr_api_model', 'asr_api_key'):
+        value = getattr(req, name)
+        if value is not None:
+            values[name] = value.strip()
+    if any(name.startswith('asr_') for name in values):
+        voice_service.validate_api(dict(archive.config(), **values))
     archive.save_config(values)
     return {'saved': True}
 
@@ -182,7 +198,20 @@ def settings(req: SettingsReq):
 def task(req: TaskReq):
     if req.action not in ('extract', 'prepare', 'discover', 'update', 'update_all', 'transcribe'):
         raise ValueError('未知任务')
-    return manager.submit(req.action, None if req.usernames is None else list(dict.fromkeys(req.usernames)), req.group_id)
+    return manager.submit(req.action, None if req.usernames is None else list(dict.fromkeys(req.usernames)), req.group_id,
+                          None if req.voice_targets is None else [t.model_dump() for t in req.voice_targets])
+
+
+class VoiceQuery(BaseModel):
+    usernames: list[str]
+    status: str = ''
+    q: str = ''
+    offset: int = 0
+
+
+@app.post('/api/voices')
+def voices(req: VoiceQuery):
+    return manager.archive().voice_page(list(dict.fromkeys(req.usernames)), req.status, req.q, req.offset)
 
 
 @app.post('/api/followed')
@@ -487,7 +516,12 @@ def export_snapshot(req, archive, connection):
 
 @app.get('/api/asr-status')
 def asr_status():
-    return voice_service.probe()
+    config = manager.archive().config() if manager.account() else {}
+    online = config.get('asr_provider', 'local') != 'local'
+    info = voice_service.probe(online=True) if online else voice_service.probe()
+    if not online and config.get('asr_model') and Path(config['asr_model']).is_file():
+        info['available'] = bool(info.get('whisper') and info.get('ffmpeg'))
+    return dict(info, provider=config.get('asr_provider', 'local'))
 
 
 @app.get('/')

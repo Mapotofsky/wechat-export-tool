@@ -1,6 +1,6 @@
 # 微信聊天档案工作台
 
-Windows 本地桌面工作台，用于维护微信 4.x 聊天档案、阅读、正文及成功语音转写检索，并导出 TXT、JSON、ZIP。React + TypeScript 静态界面由本机 FastAPI 提供，桌面窗口使用 pywebview / EdgeChromium，档案使用 SQLite。密钥、聊天数据及识别均在本机处理。
+Windows 本地桌面工作台，用于维护微信 4.x 聊天档案、阅读、正文及成功语音转写检索，并导出 TXT、JSON、ZIP。React + TypeScript 静态界面由本机 FastAPI 提供，桌面窗口使用 pywebview / EdgeChromium，档案使用 SQLite。密钥和聊天档案在本机处理；语音默认本地识别，也可自行配置在线 API。
 
 阅读顺序：[启动与便携版](#使用便携版) → [使用流程](#首次准备) → [项目架构](#项目架构) → [开发与构建](#开发与构建) → [使用边界](#使用边界)。架构描述对应当前源码；已构建应用与发行 ZIP 是需要单独更新的程序副本。
 
@@ -11,7 +11,7 @@ Windows 本地桌面工作台，用于维护微信 4.x 聊天档案、阅读、�
 本项目工作区根目录的同名脚本会使用 `dist/` 中已构建的完整语音版（没有时使用基础版），并继续读取工作区原有 `local_data/`。发布包内的脚本则读取包根目录自己的 `local_data/`。开发源码请使用下文的开发命令启动。
 
 - 基础版：目录与身份准备、密钥工具、导入、阅读、搜索、分析和导出。
-- 完整语音版：另带独立 CPU Python 运行时、Whisper small 模型、SILK 解码和 FFmpeg。首次转写不要求 GPU，也不会下载模型。
+- 完整语音版：另带独立语音 Python 运行时（默认包含 CUDA 12.1，自动选择 GPU / CPU）、Whisper small 模型、SILK 解码和 FFmpeg。首次转写不要求 GPU，也不会下载模型。
 - 支持 Windows 10/11 x64，需要 .NET Framework 4.6.2 或更新版本、WebView2 Runtime；完整语音版还需要 Visual C++ 2015–2022 x64 Runtime。带原生前置组件的发布包在 `prerequisites/` 附有离线安装器，缺少时按启动提示安装，可能需要管理员权限或重启。构建机首次下载组件需要联网；已经备齐运行时与模型的应用在本机读取和识别数据。
 - 看到桌面工作台或首次准备页面表示启动成功。启动失败时查看提示和实际数据目录中的 `logs/desktop.log`；发布包可使用 **诊断启动.cmd** 查看终端输出。工作区根目录入口使用项目原有数据目录，日志也写入该目录。
 
@@ -74,7 +74,15 @@ Windows 本地桌面工作台，用于维护微信 4.x 聊天档案、阅读、�
 
 更新按会话、分片复用成功基准；正文变化才重新解析。消息、来源、元数据、成功基准及快照指针在 SQLite 事务内发布。失败回滚，旧档案仍可读；重启显示上次中断任务，可手动重试。加密库沿用现有稳定快照、WAL 合并与页面认证链路。
 
-完整语音包默认在 CPU 识别，自动使用 `models/small.pt`；高级设置可指定其他已有 `.pt`。语音 worker 只加载本地模型。SILK 经 pilk 解码，再由 FFmpeg 转换。成功转写按媒体内容复用，变化使旧结果失效；媒体缺失、工具缺失和识别失败分别记录，不影响其他消息。当前不提供语音播放或媒体导出。
+完整语音包的本地 Whisper 自动检测可用的 NVIDIA CUDA GPU，并在 GPU 上使用 FP16；没有可用 GPU、驱动不可用或 GPU 识别失败时使用 CPU。自动选择 `models/small.pt`，高级设置可指定其他已有 `.pt`，留空恢复默认。语音 worker 只加载本地模型；SILK 经 pilk 解码，再由 FFmpeg 转换。数据设置中的“语音识别设置 → 检查已保存配置的工具”显示检测到的设备或 CPU 回退原因；实际转写来源保存在每条语音的记录中。
+
+在“数据设置 → 语音识别设置”选择本地 Whisper、阿里 Fun-ASR-Flash 或自定义 OpenAI 兼容转写 API，保存后用于后续转写。在线模式需要完整 API 地址、模型名和可选 API Key（阿里必填）。阿里默认使用 `fun-asr-flash-2026-06-15` 和北京地域地址，可改为对应地域或业务空间地址；该接口支持直接上传 Base64 音频，见[阿里官方接口说明](https://help.aliyun.com/zh/model-studio/fun-asr-flash-recorded-speech-recognition-http-api)。自定义兼容接口填写完整的 `/v1/audio/transcriptions` 地址，接收 multipart 的 `file`、`model`、`response_format=json`，返回 `{"text":"转写文本"}`。这里的 Fun-ASR-Flash 与需要公网音频 URL 的异步 `fun-asr` 接口不同。
+
+执行在线转写时，工具先在本地解码为 16 kHz 单声道 WAV，再直接发送到已保存的 API 地址；不要求另配对象存储。在线模式仍需要语音组件中的 pilk 和 FFmpeg，无需本地 Whisper 模型或 GPU。API Key 按账号保存在本机档案中，设置界面留空保留已存 Key，也可清除；状态接口不回传 Key。配置检查只检查本地工具，不发付费请求；首次转写验证在线鉴权与模型。
+
+打开会话或勾选多个会话后，点击顶栏“语音管理”，进入独立的语音消息管理窗口。窗口固定本次会话范围，列出全部历史语音，支持按状态、转写文本或发送者筛选，每页 50 条。勾选会跨页和筛选保留，点击“核对全部选择”检查完整范围并逐项取消。“重新识别所选 N 条”使用当前保存的引擎，只处理所选消息，主动替换已有成功结果；进展和错误留在窗口中。成功结果会同步用于阅读、搜索、分析和导出。重试失败或媒体缺失时，保留旧成功文本并记录最近失败原因。
+
+普通“转写语音”仍按媒体内容复用成功转写，切换引擎不会自动重做；媒体变化使旧结果失效。媒体已清理但存在成功转写时继续保留文本，未成功的消息分别记录媒体缺失、工具缺失和识别失败。当前不提供语音播放或媒体导出。
 
 ## 项目架构
 
@@ -117,7 +125,7 @@ flowchart TB
     Manager --> Import["快照、解密、WAL 合并与消息解析"]
     Source[("微信源数据库")] --> Import
     Import --> Store
-    Manager --> Voice["独立语音 worker：CPU Whisper"]
+    Manager --> Voice["独立语音 worker：自动 GPU／CPU"]
     Voice --> Store
 ```
 
@@ -130,6 +138,8 @@ flowchart TB
 | 单线程维护执行器 | 串行执行数据准备、导入、转写等维护任务 |
 | 按需工具子进程 | 密钥工具、语音 worker 和 FFmpeg；使用明确的运行时入口 |
 | WebView2 浏览器内核进程 | 渲染界面并执行前端 JavaScript |
+
+Windows 后台工具使用 `CREATE_NO_WINDOW` 启动，覆盖语音 Python worker、下游 FFmpeg、密钥提取工具及桌面 smoke-test，不弹出控制台。工具仍使用正常的 `python.exe`，保留输出捕获、超时和退出码处理；进度、结果和错误通过工作台显示。“诊断启动.cmd”、开发及构建命令保留终端输出，主动打开导出文件仍显示对应程序窗口。
 
 桌面启动顺序是：确定资源和数据目录 → 取得同数据目录实例锁 → 检查原生依赖 → 绑定空闲 loopback 端口 → 启动 API → 请求 `/api/data-status` 确认就绪 → 打开窗口。窗口关闭时检查维护和保存状态；空闲时停止自身服务，有任务时保留窗口并提示等待。应用没有另装常驻 Windows 服务。
 
@@ -150,8 +160,8 @@ flowchart TB
 | `wechat_export.py` | 微信表读取、消息内容解析、发送者身份、标准化消息及 TXT/JSON 渲染 |
 | `encrypted_sync.py` | 稳定快照、加密页面认证、源 WAL 合并、新代次解密及不变库复用 |
 | `wcdb_key_tool_windows.py` | Windows 密钥提取与解密工具，由维护层显式启动 |
-| `voice_service.py` | 精确关联语音媒体、检查工具、复用转写和调度语音 worker |
-| `local_asr.py` | 本地 SILK 解码、音频转换、CPU Whisper 识别及 JSON 结果 |
+| `voice_service.py` | 精确关联语音媒体、检查工具、复用／重识别、调度 worker 与在线 API |
+| `local_asr.py` | 本地 SILK 解码、音频转换、自动 GPU／CPU Whisper 识别及 JSON 结果 |
 | `run.py` | 保留的命令行读取/导出与浏览器诊断入口 |
 | `scripts/build_portable.py`、`zip_portable.py`、`report_release.py` | 组装应用、按清单压缩、检查和报告发行产物 |
 
@@ -179,7 +189,8 @@ flowchart TB
 | `GET/POST /api/analysis/blocklist` | 读取或保存账号共享的内容统计排除规则 |
 | `POST /api/tasks` | 提交明确范围的维护任务 |
 | `POST /api/export`、`/api/export-search` | 导出消息时段内全部记录或当前会话搜索命中 |
-| `GET /api/asr-status` | 检查本地语音解释器、模型和解码工具 |
+| `POST /api/voices` | 固定会话范围分页查询语音及转写状态 |
+| `GET /api/asr-status` | 检查当前引擎所需的本地工具；本地模式显示 GPU／CPU |
 
 API 和静态前端同源提供。原生桥仅暴露目录选择、保存导出、打开刚保存的文件和最小化四个动作；业务仍经 API 执行。桌面保存先请求导出内容，取响应建议文件名，再显示 Windows 保存对话框并落盘；写入完成才返回成功。浏览器模式共用导出 API，由浏览器处理下载。
 
@@ -236,21 +247,23 @@ local_data/
 
 阅读与分析的请求模型不同：普通阅读/搜索面向一个会话，分析还具有固定多会话范围和组合筛选。当前“仅搜索命中导出”对应单会话正文搜索条件；分析组合筛选的原文入口通过分析回查接口读取，不自动变成该导出的范围。
 
-### 本地语音链路
+### 语音识别链路
 
 ```mermaid
 flowchart LR
     Message["归档语音消息"] --> Media["精确关联 VoiceInfo 媒体"]
     Media --> Worker["voice-runtime Python：local_asr.py"]
     Worker --> Decode["pilk 解码 SILK／FFmpeg 转换"]
-    Decode --> Model["本地 small.pt：CPU Whisper"]
+    Decode --> Model["本地 small.pt：自动 GPU／CPU"]
+    Decode --> Online["可选在线 API：Fun-ASR-Flash／OpenAI 兼容"]
     Model --> Result["JSON 识别结果"]
+    Online --> Result
     Result --> Transcript["档案 transcripts 表"]
 ```
 
 媒体关联结合会话、local_id、服务器 ID 和时间，避免错误关联。`voice_service.py` 先判断已有成功结果是否可复用，需要识别时才写临时媒体并启动 worker，最后保存成功或失败状态。媒体已清理而已有成功文本时保留文本。
 
-基础解释器负责桌面、API、归档和密钥工具；独立语音解释器承载 PyTorch、Whisper、NumPy、pilk 等较重依赖。worker 显式加载本地模型并使用 CPU，结果进入预览、检索及导出。便携基础版不借用开发机语音环境，缺少组件时给出提示。
+基础解释器负责桌面、API、归档和密钥工具；独立语音解释器承载 PyTorch、Whisper、NumPy、pilk 等较重依赖。本地 worker 显式加载本地模型并自动选择 GPU／CPU；在线模式由基础解释器发送解码后的 WAV，结果进入预览、检索及导出。便携基础版不借用开发机语音环境，缺少组件时给出提示。
 
 ## 开发与构建
 
@@ -278,7 +291,7 @@ python scripts/zip_portable.py "dist/微信聊天档案 基础版" "dist/微信�
 python scripts/zip_portable.py "dist/微信聊天档案 完整语音版" "dist/微信聊天档案-完整语音版.zip"
 ```
 
-构建脚本下载官方 CPython 3.11.9 Windows x64 嵌入式运行时，在包内安装 `requirements-desktop.lock` 和可选的 `requirements-voice.lock` 固定依赖，不复制本机 Conda 环境。前端依赖由 `frontend/package-lock.json` 固定。`--prerequisites` 将微软原生组件离线安装器纳入包内；首次构建需要联网下载这些资源。
+构建脚本下载官方 CPython 3.11.9 Windows x64 嵌入式运行时，在包内安装 `requirements-desktop.lock` 和可选的 `requirements-voice.lock` 固定依赖，不复制本机 Conda 环境。语音包默认安装 CUDA 12.1 版 PyTorch；加入 `--voice-device cpu` 可构建较小的纯 CPU 包。CUDA 包包含运行库，用户电脑无需安装 CUDA Toolkit，但使用 GPU 需要兼容的 NVIDIA 驱动；无可用 GPU 时使用 CPU。前端依赖由 `frontend/package-lock.json` 固定。`--prerequisites` 将微软原生组件离线安装器纳入包内；首次构建需要联网下载这些资源。
 
 完整语音包的结构如下；基础版不含 `voice-runtime`、模型和 FFmpeg：
 
@@ -288,7 +301,7 @@ python scripts/zip_portable.py "dist/微信聊天档案 完整语音版" "dist/�
 ├─ 诊断启动.cmd
 ├─ app/                       Python 程序及 web/static 静态资源
 ├─ runtime/                   基础 Python 与依赖
-├─ voice-runtime/             CPU 语音 Python 与依赖
+├─ voice-runtime/             语音 Python 与依赖（CUDA／CPU）
 ├─ models/small.pt            本地识别模型
 ├─ tools/ffmpeg.exe           音频转换工具
 ├─ prerequisites/             原生依赖说明与可选离线安装器
@@ -340,6 +353,7 @@ python scripts/benchmark_search.py
 | `tests/test_search.py`、`test_analysis.py` | 两字正文、转写、分析统计、组合筛选及原文回查口径 |
 | `tests/test_maintenance.py`、`test_selective_import.py`、`test_import_performance.py` | 账号隔离、历史保留、选择性处理、变化更新与事务发布 |
 | `tests/test_desktop.py`、`test_launcher.py`、`test_view_state.py` | 路径、子进程入口、保存、关闭、实例锁及账号阅读状态 |
+| `tests/test_background_processes.py` | 后台隐藏参数、含空格路径、输出捕获、失败与超时；密钥工具只用模拟子进程 |
 | `tests/test_usability.py`、`test_web_http.py`、`test_export_invariants.py` | 会话检索、日期、HTTP 流程和导出 |
 | `tests/test_projects.py` | 重叠项目、类型多选、隐藏范围、账号隔离、清理及恢复后重新导入 |
 | `tests/test_encrypted_wal.py` | 合成加密数据库和 WAL 行为 |
@@ -347,6 +361,8 @@ python scripts/benchmark_search.py
 | `scripts/probe_analysis.py`、`benchmark_search.py` | 合成分析范围和检索性能探测 |
 | `scripts/probe_projects.py --app <应用目录/app>` | 用指定应用副本验证项目、隐藏和清理恢复；应使用该包的 `runtime/python.exe` 运行 |
 | `scripts/report_release.py` | 检查发行 ZIP 清单并报告实际文件、依赖和原生安装器信息 |
+
+后台窗口验收使用包内 `runtime/pythonw.exe` 运行 `scripts/probe_background.py --app "<包目录>/app" --output "<新的隔离证据目录>"`。脚本执行实际 `desktop.py`、EdgeChromium、随包语音 worker 和 FFmpeg，以合成语音及本地模拟 API 验证识别与解码错误，记录原生进程启动参数、控制台与焦点事件；不读取真实微信数据。它会先短暂打开一个校准控制台，确认窗口监测有效。基础版加入 `--base` 检查缺少语音组件的提示；加入 `--base --smoke` 检查桌面验证入口。输出目录保留合成数据、进程记录和 `background-probe.json`，临时服务随窗口关闭停止。窗口事件覆盖整个桌面，验收时应避免另行打开终端或切换窗口；无关窗口事件不能直接归因于应用。
 
 ## 使用边界
 

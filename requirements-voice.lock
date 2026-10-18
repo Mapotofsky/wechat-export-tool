@@ -1,6 +1,6 @@
-# CPU wheel index is selected by scripts/build_portable.py.
+# CPU/CUDA wheel variant is selected by scripts/build_portable.py.
 openai-whisper==20250625
-torch==2.5.1+cpu
+torch==2.5.1
 numpy==2.2.6
 pilk==0.2.4
 imageio-ffmpeg==0.6.0

@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 import tempfile
 import sqlite3
+import io
+import wave
 from contextlib import closing
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -31,6 +33,31 @@ if __name__ == '__main__':
     with tempfile.TemporaryDirectory(prefix='wechat_ui_test_') as tmp:
         source = Path(tmp) / 'source'
         rich_seed(source)
+        if '--voice-asr' in sys.argv:
+            # Local mock API plus real audio conversion, with no external calls.
+            from fastapi import Request
+            @web.app.post('/synthetic/asr')
+            async def synthetic_asr(request: Request):
+                body = await request.body()
+                if b'RIFF' not in body or b'name="file"' not in body:
+                    raise ValueError('Expected decoded WAV multipart upload')
+                return {'text': '合成在线识别：会议安排已更新'}
+            with closing(sqlite3.connect(source / 'message/message_1.db')) as c, c:
+                from test_maintenance import table
+                c.executemany(f'INSERT INTO "{table("second@chatroom")}" VALUES (?,?,34,8,?,"voice",0)',
+                              [(9, 209, 1700691201), (10, 210, 1700691202)])
+            audio = io.BytesIO()
+            with wave.open(audio, 'wb') as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(16000)
+                stream.writeframes(b'\0\0' * 1600)
+            with closing(sqlite3.connect(source / 'message/media_0.db')) as c, c:
+                c.execute('CREATE TABLE Name2Id(user_name TEXT)')
+                c.execute('INSERT INTO Name2Id(rowid,user_name) VALUES (99,"second@chatroom")')
+                c.execute('CREATE TABLE VoiceInfo(chat_name_id INTEGER,local_id INTEGER,svr_id INTEGER,create_time INTEGER,voice_data BLOB,data_index TEXT)')
+                c.executemany('INSERT INTO VoiceInfo VALUES (99,?,?,?,?,"synthetic")',
+                              [(i, 200+i, 1700691200+i-8, audio.getvalue()) for i in (8, 9, 10)])
         web.manager = Manager(Path(tmp) / 'state')
         if '--prepared' in sys.argv:
             web.manager.select(str(source), 'synthetic_preview', True)

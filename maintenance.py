@@ -134,6 +134,7 @@ class Manager:
         if account:
             archive = self.archive()
             config = archive.config()
+            config['asr_api_key_set'] = bool(config.pop('asr_api_key', ''))
         with self.lock:
             if self.task and account and self.task['account_id'] == account['id']:
                 task = dict(self.task)
@@ -144,7 +145,7 @@ class Manager:
         return {'account': account, 'accounts': self.registry['accounts'], 'config': config,
                 'task': task, 'wal_validation': '尚未执行真实微信加密 WAL 端到端验证'}
 
-    def submit(self, action, usernames=None, group_id=None):
+    def submit(self, action, usernames=None, group_id=None, voice_targets=None):
         with self.lock:
             if self.busy():
                 raise ValueError('已有维护任务正在执行，可继续查看列表和导出')
@@ -165,10 +166,16 @@ class Manager:
                 raise ValueError('处理范围为空；请先保存关注会话或明确选择会话')
             if action == 'transcribe' and set(usernames) - {r['username'] for r in archive.contacts()}:
                 raise ValueError('所选会话尚未导入；请先导入所选会话')
+            if voice_targets is not None:
+                if action != 'transcribe':
+                    raise ValueError('仅语音转写支持消息选择')
+                archive.voice_targets(usernames, voice_targets)
             task = {'id': uuid.uuid4().hex, 'account_id': account['id'], 'action': action,
                     'status': 'running', 'stage': '准备', 'done': 0, 'total': 0, 'started': now(),
                     'next_step': '', 'reason': '', 'selected_usernames': usernames, 'selected_count': len(usernames),
                     'scope': 'all' if action == 'update_all' else 'selected'}
+            if voice_targets is not None:
+                task['voice_targets'] = voice_targets
             self.task = task
             atomic_json(archive.directory / 'task.json', task)
             self.executor.submit(self.perform, account, archive, task, action, usernames)
@@ -181,7 +188,8 @@ class Manager:
             nonlocal last_publication
             with self.lock:
                 if action in ('update', 'update_all', 'transcribe'):
-                    stage += ' · 全部会话' if action == 'update_all' else f' · 已选 {len(usernames)} 个会话'
+                    stage += (f" · 已选 {len(task['voice_targets'])} 条语音" if 'voice_targets' in task else
+                              ' · 全部会话' if action == 'update_all' else f' · 已选 {len(usernames)} 个会话')
                 task.update(stage=stage, done=done, total=total)
                 if time.monotonic() - last_publication >= .5:
                     atomic_json(task_path, task)
@@ -197,7 +205,8 @@ class Manager:
                 keys = archive.directory / ('keys_' + uuid.uuid4().hex + '.json')
                 result = subprocess.run([str(python_executable()), str(resource_root() / 'wcdb_key_tool_windows.py'),
                                          'extract', '--db-dir', account['directory'], '--output', str(keys)],
-                                        capture_output=True, timeout=600)
+                                        capture_output=True, timeout=600,
+                                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
                 if result.returncode or not keys.exists():
                     raise RuntimeError('密钥提取失败。请确认微信已登录且当前进程有读取权限，必要时以管理员身份启动后重试')
                 archive.save_config({'keys_file': str(keys)})
@@ -245,8 +254,12 @@ class Manager:
                     archive.save_config({'decrypted_dir': str(db_dir), 'media_snapshot': str(db_dir),
                                          'message_snapshot': config.get('message_snapshot') or config.get('decrypted_dir')})
                     config['decrypted_dir'] = str(db_dir)
-                progress('检查本地识别工具')
-                info = voice_service.probe()
+                online = config.get('asr_provider', 'local') != 'local'
+                voice_service.validate_api(config)
+                progress('检查在线识别与音频工具' if online else '检查本地识别工具')
+                info = voice_service.probe(online=True) if online else voice_service.probe()
+                if not online and config.get('asr_model') and Path(config['asr_model']).is_file():
+                    info['available'] = bool(info.get('whisper') and info.get('ffmpeg'))
                 if not info['available']:
                     raise voice_service.ToolUnavailable(info.get('reason', '本地识别工具不可用'))
                 model = config.get('asr_model') or next((m for m in info.get('models', []) if Path(m).name == 'small.pt'), '')
@@ -256,8 +269,12 @@ class Manager:
                         raise voice_service.ToolUnavailable(info.get('reason', '本地识别工具不可用'))
                     if media.startswith((b'\x02#!SILK_V3', b'#!SILK_V3')) and not info.get('silk'):
                         raise voice_service.ToolUnavailable('缺少 SILK 解码工具 pilk')
-                    return voice_service.recognize(media, chosen_model)
-                result = voice_service.transcribe(archive, config['decrypted_dir'], usernames, model, progress, recognizer)
+                    if online:
+                        return voice_service.recognize_online(media, config)
+                    result = voice_service.recognize(media, chosen_model, details=True)
+                    return dict(result, provider='local', model=chosen_model)
+                result = voice_service.transcribe(archive, config['decrypted_dir'], usernames, model, progress, recognizer,
+                                                 targets=task.get('voice_targets'), force='voice_targets' in task)
             else:
                 raise ValueError('未知任务')
             if manifest:
