@@ -11,13 +11,15 @@ from contextlib import closing
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Literal
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from maintenance import Manager, inspect_directory, identity_candidates
 import voice_service
 import wechat_export as we
 from runtime_paths import data_root
+import archive_analysis as analysis
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_DIR = ROOT / 'decrypted'
@@ -254,6 +256,79 @@ def messages(username: str, q: str = '', start: int | None = None, end: int | No
 @app.get('/api/context')
 def context(username: str, message_id: str, before: int = 10, after: int = 10):
     return manager.archive().context(username, message_id, before, after)
+
+
+class AnalysisFilters(BaseModel):
+    username: str | None = None
+    sender_key: str | None = None
+    kind: int | None = None
+    voice_status: str | None = None
+    hour: int | None = Field(default=None, ge=0, le=23)
+    weekday: int | None = Field(default=None, ge=0, le=6)
+    start: int | None = None
+    end: int | None = None
+    terms: list[str] = Field(default_factory=list)
+    term_mode: Literal['text', 'word', 'phrase'] = 'text'
+
+
+class AnalysisWindow(BaseModel):
+    start: int | None = None
+    end: int | None = None
+
+
+class AnalysisReq(AnalysisWindow):
+    account_id: str
+    usernames: list[str]
+    q: str = ''
+    include_transcripts: bool = True
+    filters: AnalysisFilters = Field(default_factory=AnalysisFilters)
+    comparison: AnalysisWindow = Field(default_factory=AnalysisWindow)
+    gap_minutes: int = Field(default=30, gt=0)
+    keywords: list[str] = Field(default_factory=list)
+    session_offset: int = Field(default=0, ge=0)
+    offset: int = Field(default=0, ge=0)
+
+
+def analysis_archive(account_id):
+    with manager.lock:
+        if not manager.account() or manager.account()['id'] != account_id:
+            raise ValueError('账号已切换，请重新加载分析')
+        return manager.archive()
+
+
+@app.post('/api/analysis')
+def analyze(req: AnalysisReq):
+    return analysis.analyze(analysis_archive(req.account_id), req)
+
+
+@app.post('/api/analysis/messages')
+def analyze_messages(req: AnalysisReq):
+    validate_range(req.start, req.end)
+    return analysis.analysis_messages(analysis_archive(req.account_id), req)
+
+
+class BlockRule(BaseModel):
+    text: str
+    mode: Literal['exact', 'contains'] = 'exact'
+
+
+class BlocklistReq(BaseModel):
+    account_id: str
+    rules: list[BlockRule]
+
+
+@app.get('/api/analysis/blocklist')
+def analysis_blocklist(account_id: str):
+    return {'rules': analysis.rules_for(analysis_archive(account_id))}
+
+
+@app.post('/api/analysis/blocklist')
+def save_analysis_blocklist(req: BlocklistReq):
+    rules = analysis.normalize_rules([r.model_dump() for r in req.rules])
+    with manager.lock:
+        archive = analysis_archive(req.account_id)
+        archive.save_config({'analysis_blocklist': rules})
+    return {'saved': True, 'rules': rules}
 
 
 def download(data, filename, media_type):

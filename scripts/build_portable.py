@@ -18,7 +18,7 @@ PREREQUISITES = {
     'NDP48-x86-x64-AllOS-ENU.exe': 'https://go.microsoft.com/fwlink/?linkid=2088631',
     'VC_redist.x64.exe': 'https://aka.ms/vs/17/release/vc_redist.x64.exe',
 }
-PROGRAM_FILES = ('archive_store.py', 'encrypted_sync.py', 'local_asr.py', 'maintenance.py',
+PROGRAM_FILES = ('archive_store.py', 'archive_analysis.py', 'encrypted_sync.py', 'local_asr.py', 'maintenance.py',
     'voice_service.py', 'wcdb_key_tool_windows.py', 'wechat_export.py', 'run.py',
     'runtime_paths.py', 'desktop.py')
 
@@ -141,6 +141,10 @@ def build(args):
     if args.resources_only:
         manifest_file = destination / 'release-manifest.json'
         manifest = json.loads(manifest_file.read_text(encoding='utf-8'))
+        manifest['program_files'] = list(PROGRAM_FILES)
+        manifest['packages']['base'] = collect_licenses(destination / 'runtime', destination / 'licenses' / 'base')
+        for lock in ('requirements-desktop.lock', 'requirements-voice.lock'):
+            shutil.copy2(ROOT / lock, destination / lock)
         manifest['files'] = release_files(destination)
         manifest_file.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
         print(f'Refreshed resources {destination}', flush=True)

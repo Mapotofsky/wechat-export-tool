@@ -52,6 +52,13 @@ TYPE_NAMES = {
 }
 
 
+def normalize_system_sender(message):
+    """系统通知没有说话人；保留原始 sender_id 以便回查来源。"""
+    if (message.get('type', 0) & 0xffffffff) == 10000:
+        message.update(sender='系统消息', sender_username=None, identity_basis='system')
+    return message
+
+
 def decompress(content):
     """zstd 解压（若内容以 zstd 魔数开头）"""
     if isinstance(content, bytes) and content[:4] == ZSTD_MAGIC and HAS_ZSTD:
@@ -377,7 +384,7 @@ class MessageReader:
                         self.names.get(user) or user or f'未知发送者#{sender_id}'
                         if username.endswith('@chatroom') else other_name or '对方')
                     tname, text = parse_message(r['local_type'], r['message_content']) if parse else (None, None)
-                    yield {'local_id': r['local_id'], 'source_shard': fname,
+                    yield normalize_system_sender({'local_id': r['local_id'], 'source_shard': fname,
                            'server_id': r['server_id'] if 'server_id' in columns else 0,
                            'status': r['status'] if 'status' in columns else None,
                            'sort_seq': r['sort_seq'] if 'sort_seq' in columns else 0,
@@ -385,7 +392,7 @@ class MessageReader:
                            'time': datetime.datetime.fromtimestamp(r['create_time']).strftime('%Y-%m-%d %H:%M:%S'),
                            'timestamp': r['create_time'], 'sender': sender, 'sender_id': sender_id,
                            'type': r['local_type'], 'type_name': tname, 'content': text,
-                           '_raw_content': r['message_content']}
+                           '_raw_content': r['message_content']})
         streams = [rows(fname, state) for fname, state in self.shards.items() if shards is None or fname in shards]
         return heapq.merge(*streams, key=lambda m: (m['timestamp'], m['sort_seq'] or 0, m['local_id'], m['source_shard']))
 

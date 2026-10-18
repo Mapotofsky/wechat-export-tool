@@ -119,7 +119,7 @@ class Archive:
             json_extract(m.data,'$.local_id') DESC,m.message_key DESC''' +
             (' LIMIT ? OFFSET ?' if limit is not None else ''),
             (username, start, start, end, end) + ((limit, offset) if limit is not None else ())):
-            message = json.loads(data)
+            message = we.normalize_system_sender(json.loads(data))
             message['message_id'] = key
             if (message['type'] & 0xffffffff) == 34:
                 message['transcription'] = {'status': status or 'not_requested', 'reason': reason or '',
@@ -185,7 +185,7 @@ class Archive:
             (' LIMIT ? OFFSET ?' if limit is not None else ''), params + ([limit, offset] if limit is not None else []))
         messages = []
         for key, data, status, text, reason, media_source in rows:
-            message = json.loads(data)
+            message = we.normalize_system_sender(json.loads(data))
             message['message_id'] = key
             original = message.get('content') or ''
             transcript = text if status == 'success' and (message['type'] & 0xffffffff) == 34 else ''
@@ -245,7 +245,8 @@ class Archive:
             for user, shard, sender_id, name in c.execute('''
                 SELECT json_extract(data,'$.sender_username'),json_extract(data,'$.source_shard'),
                     json_extract(data,'$.sender_id'),json_extract(data,'$.sender')
-                FROM messages WHERE username=? ORDER BY timestamp,json_extract(data,'$.sort_seq'),
+                FROM messages WHERE username=? AND (json_extract(data,'$.type') & 4294967295) != 10000
+                ORDER BY timestamp,json_extract(data,'$.sort_seq'),
                     json_extract(data,'$.local_id'),message_key''', (username,)):
                 key = user or f'{shard}:{sender_id}'
                 senders[key] = {'username': user, 'name': name}
@@ -495,6 +496,7 @@ class Archive:
                 m['sender'] = config.get('my_name', '我') if own else (
                     reader.names.get(user) or user or f"未知发送者#{m['sender_id']}"
                     if contact['category'] == 'group' else reader.names.get(username, contact['name']))
+                we.normalize_system_sender(m)
                 updated = json.dumps(m, ensure_ascii=False, sort_keys=True)
                 if updated != data:
                     writes.append((updated, username, key))

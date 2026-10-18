@@ -143,8 +143,9 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(metadata['first_timestamp'], 1700000000)
         self.assertEqual(metadata['last_timestamp'], 1700000002)
         self.assertEqual(metadata['preview'], 'third')
-        self.assertEqual(metadata['recorded_sender_count'], 3)
-        self.assertEqual({m['sender'] for m in messages}, {'我', '甲', '乙'})
+        self.assertEqual(metadata['recorded_sender_count'], 2)
+        self.assertEqual({m['sender'] for m in messages}, {'系统消息', '甲', '乙'})
+        self.assertIsNone(messages[0]['sender_username'])
 
     def test_local_ids_are_shard_scoped_and_server_promotion_merges(self):
         with closing(sqlite3.connect(self.source / 'message' / 'message_0.db')) as c, c:

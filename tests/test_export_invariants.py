@@ -132,6 +132,25 @@ class ExportInvariantTests(unittest.TestCase):
         self.assertEqual(len(others), 2)
         self.assertEqual([m["sender"] for m in others], ["成员甲", "成员乙"])
 
+    def test_system_notices_have_no_personal_sender(self):
+        username = 'test@chatroom'
+        self.message_db(username, [
+            (1, 10000, 1, 1700000000, '你撤回了一条消息'),
+            (2, 10000, 2, 1700000001, '“成员甲”撤回了一条消息'),
+            (3, 10000, 0, 1700000002,
+             zstandard.ZstdCompressor().compress('“成员乙”邀请你加入了群聊'.encode())),
+            (4, 1, 1, 1700000003, '我看到“成员甲”撤回了一条消息'),
+        ])
+        messages = export.get_messages(str(self.root), username)
+        for m in messages[:3]:
+            self.assertEqual(m['sender'], '系统消息')
+            self.assertIsNone(m['sender_username'])
+            self.assertEqual(m['identity_basis'], 'system')
+            self.assertEqual(m['type_name'], '系统消息')
+            self.assertTrue(m['content'])
+        self.assertEqual(messages[3]['sender'], '我')
+        self.assertNotEqual(messages[3]['identity_basis'], 'system')
+
     def test_read_error_is_reported_instead_of_silent_omission(self):
         username = "wxid_broken"
         self.message_db(username, [], missing_content=True)
