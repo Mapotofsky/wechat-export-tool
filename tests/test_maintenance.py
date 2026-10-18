@@ -262,13 +262,46 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(self.archive.messages(self.username)[-1]['transcription']['status'], 'tool_unavailable')
         def failed(*args):
             raise RuntimeError('recognition failed')
-        voice_service.transcribe(self.archive, self.source, [self.username], '', recognizer=failed)
+        result = voice_service.transcribe(self.archive, self.source, [self.username], '', recognizer=failed)
+        self.assertEqual(result['errors'], [{'reason': 'RuntimeError：recognition failed', 'count': 1}])
         self.assertEqual(self.archive.messages(self.username)[-1]['transcription']['status'], 'failed')
         with closing(sqlite3.connect(path)) as c, c:
             c.execute('DELETE FROM VoiceInfo')
         voice_service.transcribe(self.archive, self.source, [self.username], '', recognizer=failed)
         self.assertEqual(self.archive.messages(self.username)[-1]['transcription']['status'], 'media_missing')
         self.assertEqual(len(self.archive.messages(self.username)), 3)
+
+    def test_transcribe_task_retains_failure_details(self):
+        self.add_voice()
+        manager = Manager(self.root / 'state')
+        self.addCleanup(manager.executor.shutdown)
+        manager.select(str(self.source), 'synthetic', True)
+        manager.archive().save_config({'self_username': 'wxid_self'})
+        manager.archive().update(self.source)
+        with patch.object(voice_service, 'probe', side_effect=TypeError('probe returned None')):
+            task = manager.submit('transcribe', [self.username])
+            manager.executor.shutdown()
+        task = manager.status()['task']
+        self.assertEqual(task['status'], 'failed')
+        self.assertIn('TypeError：probe returned None', task['reason'])
+        self.assertIn('检查本地识别工具', task['failed_stage'])
+        self.assertTrue(task['error_location'])
+
+    def test_transcribe_task_with_failed_messages_is_failed(self):
+        self.add_voice()
+        manager = Manager(self.root / 'state')
+        self.addCleanup(manager.executor.shutdown)
+        manager.select(str(self.source), 'synthetic', True)
+        manager.archive().save_config({'self_username': 'wxid_self'})
+        manager.archive().update(self.source)
+        with patch.object(voice_service, 'probe', return_value={'available': True, 'models': []}), patch.object(
+                voice_service, 'recognize', side_effect=RuntimeError('模型加载失败')):
+            manager.submit('transcribe', [self.username])
+            manager.executor.shutdown()
+        task = manager.status()['task']
+        self.assertEqual(task['status'], 'failed')
+        self.assertEqual(task['result']['failed'], 1)
+        self.assertIn('模型加载失败', task['result']['errors'][0]['reason'])
 
     def test_api_metadata_filters_and_export_formats(self):
         manager = Manager(self.root / 'state')

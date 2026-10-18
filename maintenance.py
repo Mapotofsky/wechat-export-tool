@@ -2,18 +2,19 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
-import sqlite3
+import logging
 from pathlib import Path
 import subprocess
-import sys
 import threading
 import time
+import traceback
 import uuid
 
 from archive_store import Archive, now
 import encrypted_sync
 import voice_service
 import wechat_export as we
+from runtime_paths import python_executable, resource_root
 
 
 def atomic_json(path, data):
@@ -186,7 +187,7 @@ class Manager:
                 progress('读取微信进程并验证候选密钥')
                 # The existing tool can print identity/key details: capture and do not expose its logs.
                 keys = archive.directory / ('keys_' + uuid.uuid4().hex + '.json')
-                result = subprocess.run([sys.executable, str(Path(__file__).parent / 'wcdb_key_tool_windows.py'),
+                result = subprocess.run([str(python_executable()), str(resource_root() / 'wcdb_key_tool_windows.py'),
                                          'extract', '--db-dir', account['directory'], '--output', str(keys)],
                                         capture_output=True, timeout=600)
                 if result.returncode or not keys.exists():
@@ -238,6 +239,8 @@ class Manager:
                     config['decrypted_dir'] = str(db_dir)
                 progress('检查本地识别工具')
                 info = voice_service.probe()
+                if not info['available']:
+                    raise voice_service.ToolUnavailable(info.get('reason', '本地识别工具不可用'))
                 model = config.get('asr_model') or next((m for m in info.get('models', []) if Path(m).name == 'small.pt'), '')
                 # Per-message failures are persisted; exports remain available.
                 def recognizer(media, chosen_model):
@@ -256,8 +259,14 @@ class Manager:
                     'snapshot_bytes': sum(x.get('snapshot_bytes', 0) for x in manifest.values()),
                     'materialized_bytes': sum(x.get('source_bytes', 0) for x in manifest.values() if not x['reused'])}
             with self.lock:
-                task.update(status='success', stage='完成', result=result, finished=now(), next_step=result.get('next_step', '可查看列表或导出'))
+                if action == 'transcribe' and result['failed']:
+                    task.update(status='failed', stage='转写结束，存在失败语音', result=result,
+                                reason=f"{result['failed']} 条语音转写失败，具体原因见下方汇总", finished=now(),
+                                next_step='按错误汇总修复工具后重试；成功的转写会自动复用')
+                else:
+                    task.update(status='success', stage='完成', result=result, finished=now(), next_step=result.get('next_step', '可查看列表或导出'))
         except BaseException as exc:
+            logging.getLogger(__name__).exception('维护任务 %s 在 %s 失败', action, task['stage'])
             with self.lock:
                 # Avoid printing raw SQL values or subprocess output.
                 if isinstance(exc, OSError):
@@ -265,8 +274,10 @@ class Manager:
                     code = getattr(exc, 'winerror', None) or exc.errno
                     reason = f'{type(exc).__name__}：文件 {filename} 操作失败（系统错误 {code}：{exc.strerror}）'
                 else:
-                    reason = str(exc) if isinstance(exc, (ValueError, RuntimeError, sqlite3.Error)) else f'{type(exc).__name__}：任务执行失败'
+                    reason = f'{type(exc).__name__}：{exc}'
+                frame = traceback.extract_tb(exc.__traceback__)[-1]
                 task.update(status='failed', failed_stage=task['stage'], reason=reason, finished=now(),
+                            error_location=f'{Path(frame.filename).name}:{frame.lineno} · {frame.name}',
                             next_step='按失败原因调整目录、身份或工具后重新执行；此前可用档案仍保留')
         finally:
             with self.lock:

@@ -19,7 +19,11 @@ def rich_seed(source):
         c.execute("UPDATE contact SET remark='项目备注',nick_name='另一个人',alias='public_bob' WHERE username='wxid_b'")
         c.executemany('INSERT INTO contact VALUES (?,?,1,?,?)', [
             ('second@chatroom', '', '第二群', ''), ('pending', 'pending_alias', '未导入联系人', '')])
-    shard(source, 1, 'second@chatroom', [(i, 200+i, 1, 8, 1700000000+i*86400, f'day {i}', 0) for i in range(1,9)])
+    texts = ['本周报销材料已提交', '合同第二版请核对', '报销发票需要补充抬头',
+             '明天会议讨论项目进度', '报销审批已通过', '合同附件已归档',
+             '请核对报销金额 1200 元', '[语音]']
+    shard(source, 1, 'second@chatroom', [(i, 200+i, 34 if i == 8 else 1, 8,
+          1700000000+i*86400, texts[i-1], 0) for i in range(1,9)])
     shard(source, 2, 'wxid_a', [(1, 301, 1, 8, 1700000000, 'before gap', 0),
                               (2, 302, 1, 8, 1700864000, 'after gap', 0)])
 
@@ -32,6 +36,8 @@ if __name__ == '__main__':
             web.manager.select(str(source), 'synthetic_preview', True)
             web.manager.archive().save_config({'self_username': 'wxid_self'})
             web.manager.archive().update(source)
+            web.manager.archive().save_transcript('second@chatroom', 'server:208', b'synthetic',
+                                                 'success', text='语音确认：报销已经到账')
         # Avoid inspecting real machine directories in this synthetic browser fixture.
         web.suggest_directory = lambda: {'directory': '', 'decrypted_default': str(source)}
         for route in web.app.routes:

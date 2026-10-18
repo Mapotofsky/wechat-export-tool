@@ -1,0 +1,22 @@
+# Windows x64 CPython 3.11 portable base, including transitive dependencies.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.1
+bottle==0.13.4
+cffi==2.1.1
+click==8.5.0
+clr_loader==0.2.10
+fastapi==0.141.1
+uvicorn==0.53.0
+zstandard==0.25.0
+pydantic==2.12.5
+starlette==1.0.0
+pywebview==6.1
+pythonnet==3.0.5
+h11==0.16.0
+idna==3.20
+proxy_tools==0.1.0
+pycparser==3.11
+pydantic_core==2.41.5
+typing-inspection==0.4.4
+typing_extensions==4.16.0

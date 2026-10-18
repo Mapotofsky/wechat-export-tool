@@ -137,6 +137,95 @@ class Archive:
             AND (? IS NULL OR timestamp>=?) AND (? IS NULL OR timestamp<=?)''',
             (username, start, start, end, end)).fetchone()[0]
 
+    @staticmethod
+    def search_condition(username, q='', start=None, end=None, day=None, include_transcripts=True):
+        if start is not None and end is not None and start > end:
+            raise ValueError('开始日期不能晚于结束日期')
+        clauses = ['m.username=?']
+        params = [username]
+        for bound, operator in ((start, '>='), (end, '<=')):
+            if bound is not None:
+                clauses.append('m.timestamp' + operator + '?')
+                params.append(bound)
+        if day:
+            try:
+                parsed = datetime.date.fromisoformat(day)
+            except ValueError:
+                raise ValueError('日期必须为 YYYY-MM-DD')
+            if parsed.isoformat() != day:
+                raise ValueError('日期必须为 YYYY-MM-DD')
+            clauses.append("date(m.timestamp,'unixepoch','localtime')=?")
+            params.append(day)
+        if q:
+            body = "instr(lower(coalesce(json_extract(m.data,'$.content'),'')),lower(?))>0"
+            params.append(q)
+            if include_transcripts:
+                body += " OR (t.status='success' AND (json_extract(m.data,'$.type') & 4294967295)=34 AND instr(lower(t.text),lower(?))>0)"
+                params.append(q)
+            clauses.append('(' + body + ')')
+        return ' AND '.join(clauses), params
+
+    def search(self, username, q='', start=None, end=None, day=None, include_transcripts=True,
+               offset=0, limit=50, connection=None):
+        if offset < 0 or (limit is not None and not 1 <= limit <= 500):
+            raise ValueError('分页位置不能小于零，每页数量须为 1 至 500')
+        if connection is None:
+            with closing(self.connect()) as c:
+                c.execute('BEGIN')
+                return self.search(username, q, start, end, day, include_transcripts, offset, limit, c)
+        condition, params = self.search_condition(username, q, start, end, day, include_transcripts)
+        source = ''' FROM messages m LEFT JOIN transcripts t
+            ON t.username=m.username AND t.message_key=m.message_key WHERE ''' + condition
+        daily = [{'day': d, 'count': n} for d, n in connection.execute(
+            "SELECT date(m.timestamp,'unixepoch','localtime') AS day,count(*)" + source + ' GROUP BY day ORDER BY day', params)]
+        total = sum(bucket['count'] for bucket in daily)
+        rows = connection.execute('SELECT m.message_key,m.data,t.status,t.text,t.reason,t.source' + source + '''
+            ORDER BY m.timestamp DESC,json_extract(m.data,'$.sort_seq') DESC,
+            json_extract(m.data,'$.local_id') DESC,m.message_key DESC''' +
+            (' LIMIT ? OFFSET ?' if limit is not None else ''), params + ([limit, offset] if limit is not None else []))
+        messages = []
+        for key, data, status, text, reason, media_source in rows:
+            message = json.loads(data)
+            message['message_id'] = key
+            original = message.get('content') or ''
+            transcript = text if status == 'success' and (message['type'] & 0xffffffff) == 34 else ''
+            if (message['type'] & 0xffffffff) == 34:
+                message['transcription'] = {'status': status or 'not_requested', 'reason': reason or '',
+                    'media_source': json.loads(media_source) if media_source else None}
+                if status == 'success':
+                    message['content'] = text
+            needle = q.lower()
+            sources = []
+            if q and needle in original.lower():
+                sources.append('content')
+            if q and include_transcripts and needle in transcript.lower():
+                sources.append('transcript')
+            snippet_text = transcript if 'transcript' in sources else original
+            position = max(0, snippet_text.lower().find(needle) - 40) if q else 0
+            message.update(search_sources=sources, snippet=snippet_text[position:position + 160])
+            messages.append(message)
+        return {'messages': list(reversed(messages)), 'total': total, 'daily': daily,
+                'offset': offset, 'limit': limit,
+                'query': dict(username=username, q=q, start=start, end=end, day=day,
+                              include_transcripts=include_transcripts)}
+
+    def context(self, username, message_id, before=10, after=10):
+        if not 0 <= before <= 100 or not 0 <= after <= 100:
+            raise ValueError('上下文数量须为 0 至 100')
+        with closing(self.connect()) as c:
+            c.execute('BEGIN')
+            rows = c.execute('''SELECT message_key FROM messages WHERE username=? ORDER BY timestamp,
+                json_extract(data,'$.sort_seq'),json_extract(data,'$.local_id'),message_key''', (username,)).fetchall()
+            keys = [r[0] for r in rows]
+            if message_id not in keys:
+                raise ValueError('消息不存在于当前会话')
+            target = keys.index(message_id)
+            first, last = max(0, target - before), min(len(keys), target + after + 1)
+            messages = self.messages(username, c, limit=last-first, offset=len(keys)-last)
+            for message in messages:
+                message['is_target'] = message['message_id'] == message_id
+            return {'messages': messages, 'target_id': message_id, 'target_index': target-first}
+
     def metadata(self, c, username, contact, reuse=False):
         if reuse:
             row = c.execute('SELECT data FROM chats WHERE username=?', (username,)).fetchone()

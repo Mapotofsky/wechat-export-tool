@@ -1,26 +1,41 @@
 """VoiceInfo lookup uses the media shard's own Name2Id, never message sender ids."""
 from contextlib import closing
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 
 import wechat_export as we
+from runtime_paths import voice_python_executable, resource_root
 
-PYTHON = Path(r'D:\efficiency\anaconda3\envs\pytorch\python.exe')
-WORKER = Path(__file__).parent / 'local_asr.py'
+PYTHON = voice_python_executable()
+WORKER = resource_root() / 'local_asr.py'
 
 
 class ToolUnavailable(RuntimeError):
     pass
 
 
+def run_worker(python, *args, timeout):
+    # pythonw hosts and Windows consoles can use different default encodings.
+    return subprocess.run([str(python), str(WORKER), *args], capture_output=True,
+                          text=True, encoding='utf-8', errors='replace', timeout=timeout,
+                          env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
+
+
+def process_failure(result):
+    detail = (result.stderr or result.stdout or '').strip()
+    return f'退出码 {result.returncode}；{detail[-4000:] or "进程未返回输出"}'
+
+
 def probe(python=PYTHON):
     if not Path(python).is_file():
-        return {'available': False, 'python': str(python), 'reason': f'语音解释器不存在：{python}。请检查 voice_service.py 中的 PYTHON 路径。', 'models': []}
+        return {'available': False, 'python': str(python), 'reason': '未包含语音组件。请解压完整语音包（voice-runtime、tools 和 models）到程序目录；开发环境可设置 WECHAT_ARCHIVE_VOICE_PYTHON。', 'models': []}
     try:
-        result = subprocess.run([str(python), str(WORKER), '--probe'], capture_output=True,
-                                text=True, encoding='utf-8', timeout=60)
+        result = run_worker(python, '--probe', timeout=60)
+        if result.returncode or not result.stdout:
+            raise RuntimeError(process_failure(result))
         info = json.loads(result.stdout)
         info['python'] = str(python)
         if not info['available']:
@@ -28,8 +43,8 @@ def probe(python=PYTHON):
         elif not info['silk']:
             info['reason'] = 'Whisper 可用；微信 SILK 语音仍需 pilk 解码包'
         return info
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return {'available': False, 'python': str(python), 'reason': f'本地工具检查失败。请运行 "{python}" local_asr.py --probe 检查后重试', 'models': []}
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return {'available': False, 'python': str(python), 'reason': f'本地工具检查失败（{type(exc).__name__}：{exc}）。解释器：{python}；工具：{WORKER}', 'models': []}
 
 
 def find_media(db_dir, username, message):
@@ -58,19 +73,25 @@ def recognize(media, model, python=PYTHON):
     with tempfile.TemporaryDirectory() as tmp:
         source, output = Path(tmp) / 'voice.bin', Path(tmp) / 'result.json'
         source.write_bytes(media)
-        subprocess.run([str(python), str(WORKER), '--audio', str(source), '--model', str(model),
-                        '--output', str(output)], capture_output=True, timeout=1800)
+        try:
+            process = run_worker(python, '--audio', str(source), '--model', str(model),
+                                 '--output', str(output), timeout=1800)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError('本地识别超时：单条语音处理超过 1800 秒') from exc
         if not output.exists():
-            raise RuntimeError(f'本地识别进程失败。请运行 "{python}" local_asr.py --probe 检查模型与环境')
+            raise RuntimeError(f'本地识别进程未生成结果：{process_failure(process)}；解释器：{python}；模型：{model}')
         result = json.loads(output.read_text(encoding='utf-8'))
         if result['status'] != 'success' or not result.get('text'):
             raise RuntimeError(result.get('reason', '未识别到语音文本'))
+        if process.returncode:
+            raise RuntimeError(f'本地识别进程异常退出：{process_failure(process)}')
         return result['text']
 
 
 def transcribe(archive, db_dir, usernames, model, progress=lambda *args: None, recognizer=recognize):
     selected = [(u, m) for u in usernames for m in archive.messages(u) if (m['type'] & 0xffffffff) == 34]
     counts = {'success': 0, 'reused': 0, 'missing': 0, 'failed': 0}
+    errors = {}
     for index, (username, m) in enumerate(selected):
         progress('提取与本地转写', index, len(selected))
         key = m['message_id']
@@ -93,8 +114,12 @@ def transcribe(archive, db_dir, usernames, model, progress=lambda *args: None, r
             archive.save_transcript(username, key, media, 'success', text=text, source=source)
             counts['success'] += 1
         except Exception as exc:
+            reason = f'{type(exc).__name__}：{exc}'
             archive.save_transcript(username, key, media, 'tool_unavailable' if isinstance(exc, ToolUnavailable) else 'failed',
-                                    reason=str(exc), source=source)
+                                    reason=reason, source=source)
+            errors[reason] = errors.get(reason, 0) + 1
             counts['failed'] += 1
     progress('完成', len(selected), len(selected))
+    if errors:
+        counts['errors'] = [{'reason': reason, 'count': count} for reason, count in errors.items()]
     return counts

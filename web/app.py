@@ -17,11 +17,12 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from maintenance import Manager, inspect_directory, identity_candidates
 import voice_service
 import wechat_export as we
+from runtime_paths import data_root
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_DIR = ROOT / 'decrypted'
 DB_SUGGESTION_EXPLICIT = False
-manager = Manager(ROOT / 'local_data')
+manager = Manager(data_root())
 app = FastAPI(title='微信聊天档案', docs_url=None, redoc_url=None)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', 'testserver'])
 
@@ -69,11 +70,45 @@ class FollowReq(BaseModel):
     usernames: list[str]
 
 
+class ViewStateReq(BaseModel):
+    account_id: str
+    active: str = ''
+    offset: int = 0
+    ms: str = ''
+    me: str = ''
+    scroll: float = 0
+
+
+@app.get('/api/view-state')
+def view_state(account_id: str | None = None):
+    with manager.lock:
+        if account_id is not None and (not manager.account() or manager.account()['id'] != account_id):
+            raise ValueError('账号已切换，请重新加载阅读位置')
+        return manager.archive().config().get('view_state', {})
+
+
+@app.post('/api/view-state')
+def save_view_state(req: ViewStateReq):
+    with manager.lock:
+        if not manager.account() or manager.account()['id'] != req.account_id:
+            raise ValueError('账号已切换，未保存旧账号阅读位置')
+        if req.offset < 0 or req.scroll < 0:
+            raise ValueError('阅读位置不能小于零')
+        manager.archive().save_config({'view_state': req.model_dump(exclude={'account_id'})})
+    return {'saved': True}
+
+
 class ExportReq(BaseModel):
     usernames: list[str]
     format: str = 'zip'
     start: int | None = None
     end: int | None = None
+
+
+class SearchExportReq(ExportReq):
+    q: str = ''
+    day: str | None = None
+    include_transcripts: bool = True
 
 
 def validate_range(start, end):
@@ -210,9 +245,52 @@ def message_count(username: str, start: int | None = None, end: int | None = Non
     return {'total': manager.archive().message_count(username, start, end)}
 
 
+@app.get('/api/messages')
+def messages(username: str, q: str = '', start: int | None = None, end: int | None = None,
+             day: str | None = None, include_transcripts: bool = True, offset: int = 0, limit: int = 50):
+    return manager.archive().search(username, q, start, end, day, include_transcripts, offset, limit)
+
+
+@app.get('/api/context')
+def context(username: str, message_id: str, before: int = 10, after: int = 10):
+    return manager.archive().context(username, message_id, before, after)
+
+
 def download(data, filename, media_type):
     return StreamingResponse(io.BytesIO(data), media_type=media_type,
         headers={'Content-Disposition': f"attachment; filename=\"wechat_export.{filename.rsplit('.',1)[-1]}\"; filename*=UTF-8''{quote(filename)}"})
+
+
+@app.post('/api/export-search')
+def export_search(req: SearchExportReq):
+    if len(set(req.usernames)) != 1:
+        raise ValueError('命中导出请选择一个会话')
+    if req.format not in ('txt', 'json', 'zip'):
+        raise ValueError('格式必须为 txt、json 或 zip')
+    archive = manager.archive()
+    with closing(archive.connect()) as connection:
+        connection.execute('BEGIN')
+        username = req.usernames[0]
+        contact = next((c for c in archive.contacts(connection) if c['username'] == username), None)
+        if contact is None:
+            raise ValueError('所选会话尚未导入；请先导入所选会话')
+        result = archive.search(username, req.q, req.start, req.end, req.day,
+                                req.include_transcripts, limit=None, connection=connection)
+        metadata = dict(result['query'], count=result['total'],
+                        generated_at=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
+        contact = dict(contact, total=result['total'], export_search=metadata)
+        text = '命中导出条件：' + json.dumps(metadata, ensure_ascii=False) + '\n\n' + we.render_txt(contact['name'], result['messages'])
+        record = we.render_json(contact, result['messages'])
+        base = we.export_basename(contact) + '_搜索命中'
+        if req.format != 'zip':
+            content = text if req.format == 'txt' else record
+            return download(content.encode('utf-8'), base + '.' + req.format,
+                            'text/plain; charset=utf-8' if req.format == 'txt' else 'application/json')
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as bundle:
+            bundle.writestr(base + '.txt', text)
+            bundle.writestr(base + '.json', record)
+        return download(buffer.getvalue(), base + '.zip', 'application/zip')
 
 
 @app.post('/api/export')

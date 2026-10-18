@@ -4,13 +4,17 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import wave
+from runtime_paths import models_root, ffmpeg_executable, package_root
 
 
 def capabilities():
-    models = sorted(str(p) for p in (Path.home() / '.cache' / 'whisper').glob('*.pt'))
-    ffmpeg = shutil.which('ffmpeg')
+    model_dirs = [models_root()]
+    if not (package_root() / 'runtime' / 'python.exe').is_file():
+        model_dirs.append(Path.home() / '.cache' / 'whisper')
+    models = sorted({str(p) for directory in model_dirs
+                     for p in directory.glob('*.pt')})
+    ffmpeg = ffmpeg_executable()
     if not ffmpeg and importlib.util.find_spec('imageio_ffmpeg'):
         import imageio_ffmpeg
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
@@ -49,9 +53,10 @@ def recognize(source, model_path):
         result = subprocess.run([info['ffmpeg'], '-nostdin', '-i', str(source), '-f', 's16le',
                                  '-ac', '1', '-ar', '16000', 'pipe:1'], capture_output=True, timeout=120)
         if result.returncode:
-            raise RuntimeError('本地音频解码失败，媒体格式不受支持或缓存不完整')
+            raise RuntimeError(f'本地音频解码失败（退出码 {result.returncode}）：' +
+                               result.stderr.decode('utf-8', errors='replace')[-4000:].strip())
         audio = np.frombuffer(result.stdout, np.int16).astype(np.float32) / 32768.0
-        model = whisper.load_model(str(Path(model_path).resolve()))
+        model = whisper.load_model(str(Path(model_path).resolve()), device='cpu')
         return model.transcribe(audio, language='zh', fp16=False, verbose=False)['text'].strip()
 
 
@@ -68,5 +73,5 @@ if __name__ == '__main__':
         try:
             result = {'text': recognize(args.audio, args.model), 'status': 'success'}
         except Exception as exc:
-            result = {'status': 'failed', 'reason': str(exc)}
+            result = {'status': 'failed', 'reason': f'{type(exc).__name__}：{exc}'}
         Path(args.output).write_text(json.dumps(result, ensure_ascii=False), encoding='utf-8')

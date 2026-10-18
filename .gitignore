@@ -4,3 +4,11 @@ exports/
 *__pycache__/
 local_data/
 *performance_results/
+frontend/node_modules/
+release/
+.build/
+output/
+dist/
+build-cache/
+.playwright-cli/
+frontend/*.tsbuildinfo
