@@ -2,6 +2,8 @@
 
 Windows 本地桌面工作台，用于维护微信 4.x 聊天档案、阅读、正文及成功语音转写检索，并导出 TXT、JSON、ZIP。React + TypeScript 静态界面由本机 FastAPI 提供，桌面窗口使用 pywebview / EdgeChromium，档案使用 SQLite。密钥、聊天数据及识别均在本机处理。
 
+阅读顺序：[启动与便携版](#使用便携版) → [使用流程](#首次准备) → [项目架构](#项目架构) → [开发与构建](#开发与构建) → [使用边界](#使用边界)。架构描述对应当前源码；已构建应用与发行 ZIP 是需要单独更新的程序副本。
+
 ## 使用便携版
 
 解压基础包或完整语音包到可写目录，双击 **启动微信聊天档案.cmd**。用户电脑无需 Python、Conda、Node，也不运行开发服务器。保留整个文件夹结构；不要直接在 ZIP 内运行。
@@ -10,8 +12,8 @@ Windows 本地桌面工作台，用于维护微信 4.x 聊天档案、阅读、�
 
 - 基础版：目录与身份准备、密钥工具、导入、阅读、搜索、分析和导出。
 - 完整语音版：另带独立 CPU Python 运行时、Whisper small 模型、SILK 解码和 FFmpeg。首次转写不要求 GPU，也不会下载模型。
-- Windows 原生依赖及联网补齐、离线安装条件、构建和升级方法见 [便携发布说明](docs/portable.md)。首次在干净系统使用前，按该说明检查 WebView2、.NET 及 VC++ 运行库。
-- 启动失败会显示原因，日志位于包根目录 `local_data/logs/desktop.log`，可使用 **诊断启动.cmd** 查看终端输出。
+- 支持 Windows 10/11 x64，需要 .NET Framework 4.6.2 或更新版本、WebView2 Runtime；完整语音版还需要 Visual C++ 2015–2022 x64 Runtime。带原生前置组件的发布包在 `prerequisites/` 附有离线安装器，缺少时按启动提示安装，可能需要管理员权限或重启。构建机首次下载组件需要联网；已经备齐运行时与模型的应用在本机读取和识别数据。
+- 看到桌面工作台或首次准备页面表示启动成功。启动失败时查看提示和实际数据目录中的 `logs/desktop.log`；发布包可使用 **诊断启动.cmd** 查看终端输出。工作区根目录入口使用项目原有数据目录，日志也写入该目录。
 
 升级时退出应用，保留原来的 **local_data/**，替换程序文件及运行时；模型在 **models/**，也可保留。账号、密钥、档案、转写和阅读位置保存在 `local_data/`，程序不会将它们作为发布资源打包。已有外部源目录及导出结果不会自动删除。
 
@@ -60,6 +62,180 @@ Windows 本地桌面工作台，用于维护微信 4.x 聊天档案、阅读、�
 
 完整语音包默认在 CPU 识别，自动使用 `models/small.pt`；高级设置可指定其他已有 `.pt`。语音 worker 只加载本地模型。SILK 经 pilk 解码，再由 FFmpeg 转换。成功转写按媒体内容复用，变化使旧结果失效；媒体缺失、工具缺失和识别失败分别记录，不影响其他消息。当前不提供语音播放或媒体导出。
 
+## 项目架构
+
+### 源码、运行副本、发行包和数据
+
+这四类内容分别维护，启动位置决定运行哪份程序以及默认读取哪份数据。
+
+| 类别 | 位置 | 用途与更新方式 |
+|---|---|---|
+| 源码工作区 | 根目录 Python 文件、`frontend/`、`web/`、`tests/`、`scripts/` | 开发与修改；源码修改后按需构建前端、同步运行副本 |
+| 已构建应用 | `dist/微信聊天档案 基础版/`、`dist/微信聊天档案 完整语音版/` | 包含运行时与程序，可直接运行；其中 `app/` 是组装时复制的源码和静态资源 |
+| 发行 ZIP | `dist/微信聊天档案-基础版.zip`、`dist/微信聊天档案-完整语音版.zip` | 某次构建的分发快照，解压使用；更新应用目录不会自动更新已有 ZIP |
+| 用户数据 | 实际选定的 `local_data/` | 保存账号、档案、转写、密钥及状态；升级保留，不进入发行 ZIP |
+
+当前启动入口的区别：
+
+| 入口 | 运行程序 | 默认数据位置 |
+|---|---|---|
+| 工作区根目录 `启动微信聊天档案.cmd` | 优先使用 `dist` 完整语音版，缺少时使用基础版 | 工作区根目录 `local_data/` |
+| 便携包内 `启动微信聊天档案.cmd` | 该包的 `runtime/pythonw.exe` 执行 `app/desktop.py` | 该包根目录 `local_data/` |
+| 开发环境 `python desktop.py` | 当前工作区源码及其静态资源 | 工作区根目录 `local_data/` |
+| 开发环境 `python run.py web --open-browser` | 当前工作区 API 和静态资源，由外部浏览器打开 | 工作区根目录 `local_data/` |
+
+以上数据位置均可用 `WECHAT_ARCHIVE_DATA_DIR` 显式覆盖。根目录脚本是连接已有档案与已构建应用的快捷入口，不会在双击时自动编译或同步源码。
+
+`dist` 的两个应用目录是可运行的文件夹包，两个 ZIP 是发行文件。ZIP 不参与日常运行；当前根目录启动脚本依赖 `dist` 中的应用目录。已经运行过的应用目录可能含有 `local_data/`，分发时使用按资源清单生成的 ZIP，避免把个人档案一起发送。
+
+### 运行结构与进程边界
+
+```mermaid
+flowchart TB
+    Host["桌面宿主：pywebview"] --> UI["WebView2：React 工作台"]
+    UI -->|本机 HTTP| API["FastAPI + Uvicorn"]
+    UI -->|目录、保存、打开结果| Host
+    API --> Store["Archive：查询与档案发布"]
+    API --> Analysis["本地分析：统计与原文回查"]
+    Store --> DB[("每账号 SQLite 档案")]
+    Analysis --> Store
+    API --> Manager["Manager：串行维护"]
+    Manager --> Import["快照、解密、WAL 合并与消息解析"]
+    Source[("微信源数据库")] --> Import
+    Import --> Store
+    Manager --> Voice["独立语音 worker：CPU Whisper"]
+    Voice --> Store
+```
+
+“前后端分离”体现为界面和业务通过 API 协作。桌面启动时会同时启动本机服务和窗口，使用者不需要分别管理服务器、浏览器或开发服务器。
+
+| 执行部分 | 职责 |
+|---|---|
+| GUI 主线程 | pywebview 窗口、Windows 原生交互及关闭事件 |
+| Uvicorn 服务线程 | 在 `127.0.0.1` 提供静态前端与 HTTP API |
+| 单线程维护执行器 | 串行执行数据准备、导入、转写等维护任务 |
+| 按需工具子进程 | 密钥工具、语音 worker 和 FFmpeg；使用明确的运行时入口 |
+| WebView2 浏览器内核进程 | 渲染界面并执行前端 JavaScript |
+
+桌面启动顺序是：确定资源和数据目录 → 取得同数据目录实例锁 → 检查原生依赖 → 绑定空闲 loopback 端口 → 启动 API → 请求 `/api/data-status` 确认就绪 → 打开窗口。窗口关闭时检查维护和保存状态；空闲时停止自身服务，有任务时保留窗口并提示等待。应用没有另装常驻 Windows 服务。
+
+### 模块职责与源码导航
+
+下表路径相对于源码工作区；发布后 Python 模块位于包内 `app/`，前端只有构建产物需要运行。
+
+| 模块 | 当前职责 |
+|---|---|
+| `desktop.py` | 窗口、服务就绪、重复实例锁、原生目录与保存、打开结果及退出 |
+| `runtime_paths.py` | 区分程序资源、包根目录、数据、模型、日志、基础及语音解释器 |
+| `frontend/src/main.tsx`、`style.css` | 首次准备、紧凑会话列表、阅读与搜索、选择与关注、任务及导出面板 |
+| `frontend/src/AnalysisWorkspace.tsx`、`analysis.css` | 固定分析范围、统计图表、筛选历史、消息回查和黑名单管理 |
+| `web/app.py` | 请求校验、账号与配置 API、查询/分析 API、任务提交、导出和静态资源服务 |
+| `maintenance.py` | `Manager` 账号管理、维护范围、单任务调度、进展和失败状态 |
+| `archive_store.py` | `Archive` 数据模型、消息合并、事务发布、正文检索、稳定定位及转写存储 |
+| `archive_analysis.py` | 完整范围统计、时期比较、分词与短语、TF-IDF、共现、关键词和活跃片段 |
+| `wechat_export.py` | 微信表读取、消息内容解析、发送者身份、标准化消息及 TXT/JSON 渲染 |
+| `encrypted_sync.py` | 稳定快照、加密页面认证、源 WAL 合并、新代次解密及不变库复用 |
+| `wcdb_key_tool_windows.py` | Windows 密钥提取与解密工具，由维护层显式启动 |
+| `voice_service.py` | 精确关联语音媒体、检查工具、复用转写和调度语音 worker |
+| `local_asr.py` | 本地 SILK 解码、音频转换、CPU Whisper 识别及 JSON 结果 |
+| `run.py` | 保留的命令行读取/导出与浏览器诊断入口 |
+| `scripts/build_portable.py`、`zip_portable.py`、`report_release.py` | 组装应用、按清单压缩、检查和报告发行产物 |
+
+### 界面状态、API 与原生桥
+
+前端实际使用 React、TypeScript、Vite、原生表单控件和自定义 CSS，图表直接绘制。业务请求由 `fetch` 发出，React 状态和 effect 管理加载及刷新。主工作台与分析工作台分别组织交互，没有引入独立 Node 生产服务。
+
+界面把当前打开会话、批量选择和持续关注分开；多会话分析范围在用户点击“分析所选”时独立固定。阅读、分析、维护和导出据各自明确范围执行，避免临时勾选或搜索词悄悄改变别的操作。前端约每 1.5 秒读取账号与任务状态，维护完成后保留查询条件并刷新相应结果。
+
+会话、页码、消息日期和滚动位置经 `/api/view-state` 写入账号设置，恢复与保存都校验账号。阅读状态保存在后端，所以桌面下一次使用不同随机端口也能恢复。
+
+| 接口 | 作用 |
+|---|---|
+| `GET /api/data-status` | 当前账号、配置、任务与已有数据状态 |
+| `POST /api/check-directory`、`/api/account` | 检查源目录并确认账号归属 |
+| `POST /api/identity-candidates`、`/api/settings` | 查找身份映射、保存确认的身份与高级路径 |
+| `GET /api/contacts`、`POST /api/followed` | 查询会话、保存账号关注集合 |
+| `GET /api/messages` | 当前会话分页、正文/转写检索、总数和日分布 |
+| `GET /api/context` | 用会话与稳定消息 ID 读取目标前后文 |
+| `GET/POST /api/view-state` | 按账号恢复和保存阅读位置 |
+| `POST /api/analysis` | 单或多会话统计、对比与内容分析 |
+| `POST /api/analysis/messages` | 按相同分析条件回查原文并分页 |
+| `GET/POST /api/analysis/blocklist` | 读取或保存账号共享的内容统计排除规则 |
+| `POST /api/tasks` | 提交明确范围的维护任务 |
+| `POST /api/export`、`/api/export-search` | 导出消息时段内全部记录或当前会话搜索命中 |
+| `GET /api/asr-status` | 检查本地语音解释器、模型和解码工具 |
+
+API 和静态前端同源提供。原生桥仅暴露目录选择、保存导出、打开刚保存的文件和最小化四个动作；业务仍经 API 执行。桌面保存先请求导出内容，取响应建议文件名，再显示 Windows 保存对话框并落盘；写入完成才返回成功。浏览器模式共用导出 API，由浏览器处理下载。
+
+### 数据分层与账号档案
+
+日常阅读、分析和网页导出读取已经发布的档案；维护层才按需读取微信源库。三层数据关系如下：
+
+```mermaid
+flowchart LR
+    Source["微信源库：主库与源 WAL"] --> Prepare["稳定快照／新代次解密准备"]
+    Prepare --> Parse["消息解析、身份识别与去重合并"]
+    Parse --> Archive[("已发布档案：archive.sqlite")]
+    Archive --> Explore["阅读、搜索、分析与导出"]
+```
+
+明文库可以直接供解析层读取；加密库在账号目录下产生独立的解密代次，成功后发布对应快照指针。源库路径、手工选择的密钥和外部模型属于用户输入，换机器或移动外部目录后需要重新核对这些路径。
+
+实际数据目录的组织如下：
+
+```text
+local_data/
+├─ accounts.json              账号目录绑定与当前账号
+├─ desktop.lock               同一数据目录的桌面实例锁
+├─ logs/                      桌面启动与运行日志
+└─ <账号ID>/
+   ├─ archive.sqlite          本账号档案
+   ├─ task.json               当前／最近任务状态
+   ├─ keys_<ID>.json          用户触发提取后保存的密钥
+   └─ decrypted/<代次ID>/     加密源库的准备结果及 sync.json
+```
+
+| SQLite 表 | 内容 |
+|---|---|
+| `settings` | 本人身份、关注集合、阅读位置、内容黑名单、成功更新时间、导入基准与快照路径 |
+| `chats` | 会话名称、类型、消息数、起止时间、预览及已收录发送者等元数据 |
+| `messages` | 会话、稳定消息标识、时间、标准化消息 JSON 及用于核对的输入 |
+| `transcripts` | 语音媒体输入、转写状态、文字、失败原因和媒体来源 |
+| `locations` | 源库位置与档案消息标识的关联 |
+| `current_sources` | 当前维护所核对的来源关系 |
+
+消息主键是会话 username 与 message_key 的组合。非零服务器 ID 优先；没有服务器 ID 时使用来源分片、local_id 和时间。同位置升级为服务器标识时合并，不把跨分片同号 local_id 当成同一消息。
+
+这里有两种 WAL：微信源 WAL 是需要快照与解密合并的输入；档案自身开启 SQLite WAL 模式，用于事务和读写并行。前者属于微信源数据，后者属于本应用档案存储。
+
+### 维护、查询与分析的数据一致性
+
+维护提交时固定账号和会话范围，交给 `ThreadPoolExecutor(max_workers=1)`。已有任务运行时拒绝新的维护请求；切换账号及修改身份等配置也需要等待任务完成。
+
+一次消息更新依次准备源数据、核对会话与分片成功基准、解析新增或变化输入、合并消息和来源、刷新元数据，最后在同一个 SQLite 事务内提交消息、来源、成功基准和快照指针。未提交时阅读区仍可读取此前发布的数据；失败回滚，旧档案保留。任务状态单独写入 JSON，重启识别中断任务并允许手动重试。
+
+单会话检索在 `Archive.search_condition` 统一构造会话、时段、字面关键词、成功转写及日下钻条件。正文用 SQLite `json_extract` 与 `instr` 匹配，因此两字中文可以直接查询。单次读取在同一只读快照中返回消息页和日桶，总数由日桶合计；命中导出复用条件并在执行时重新读取已发布数据。上下文按稳定消息 ID 定位，不继承关键词和日期，也不改变命中导出范围。
+
+分析层复用档案的基础查询条件，在完整日期范围内载入选定会话的消息并应用发送者、类型、语音状态、时段及词句筛选；统计不以当前阅读页代替全集。`/api/analysis` 与 `/api/analysis/messages` 使用相同分析匹配逻辑，后者用于分页回查。内容分词采用本地 jieba，黑名单规则保存在账号设置；具体口径见上文[本地分析口径](#本地分析口径)。
+
+阅读与分析的请求模型不同：普通阅读/搜索面向一个会话，分析还具有固定多会话范围和组合筛选。当前“仅搜索命中导出”对应单会话正文搜索条件；分析组合筛选的原文入口通过分析回查接口读取，不自动变成该导出的范围。
+
+### 本地语音链路
+
+```mermaid
+flowchart LR
+    Message["归档语音消息"] --> Media["精确关联 VoiceInfo 媒体"]
+    Media --> Worker["voice-runtime Python：local_asr.py"]
+    Worker --> Decode["pilk 解码 SILK／FFmpeg 转换"]
+    Decode --> Model["本地 small.pt：CPU Whisper"]
+    Model --> Result["JSON 识别结果"]
+    Result --> Transcript["档案 transcripts 表"]
+```
+
+媒体关联结合会话、local_id、服务器 ID 和时间，避免错误关联。`voice_service.py` 先判断已有成功结果是否可复用，需要识别时才写临时媒体并启动 worker，最后保存成功或失败状态。媒体已清理而已有成功文本时保留文本。
+
+基础解释器负责桌面、API、归档和密钥工具；独立语音解释器承载 PyTorch、Whisper、NumPy、pilk 等较重依赖。worker 显式加载本地模型并使用 CPU，结果进入预览、检索及导出。便携基础版不借用开发机语音环境，缺少组件时给出提示。
+
 ## 开发与构建
 
 开发者需要 Windows、Python 与 Node。用户只需要便携包。项目不再含开发机解释器绝对路径。
@@ -73,7 +249,67 @@ python desktop.py
 
 前端构建写入 `web/static/`。浏览器诊断入口为 `python run.py web --open-browser`，本机监听 `127.0.0.1`。语音开发环境可设置 `WECHAT_ARCHIVE_VOICE_PYTHON`；数据隔离可设置 `WECHAT_ARCHIVE_DATA_DIR`。便携版默认用自身的 `runtime/python.exe` 和 `voice-runtime/python.exe` 启动工具，不用冻结启动器充当解释器。
 
-完整构建命令、资源清单、许可和发布目录见 [docs/portable.md](docs/portable.md)。测试与可复现验收记录见 [docs/acceptance.md](docs/acceptance.md)。
+### 便携构建与发布
+
+前端生产构建先生成静态资源，随后组装程序和运行时，最后生成 ZIP。以下命令均在源码根目录执行；`python` 指已经准备好的构建解释器。构建完整语音版前，把已有 Whisper small 模型放到 `models/small.pt`，或将 `--model` 改为实际模型位置。
+
+```powershell
+npm --prefix frontend ci
+npm --prefix frontend run build
+python scripts/build_portable.py --output "dist/微信聊天档案 基础版" --prerequisites
+python scripts/build_portable.py --output "dist/微信聊天档案 完整语音版" --voice --model "models/small.pt" --prerequisites
+python scripts/zip_portable.py "dist/微信聊天档案 基础版" "dist/微信聊天档案-基础版.zip"
+python scripts/zip_portable.py "dist/微信聊天档案 完整语音版" "dist/微信聊天档案-完整语音版.zip"
+```
+
+构建脚本下载官方 CPython 3.11.9 Windows x64 嵌入式运行时，在包内安装 `requirements-desktop.lock` 和可选的 `requirements-voice.lock` 固定依赖，不复制本机 Conda 环境。前端依赖由 `frontend/package-lock.json` 固定。`--prerequisites` 将微软原生组件离线安装器纳入包内；首次构建需要联网下载这些资源。
+
+完整语音包的结构如下；基础版不含 `voice-runtime`、模型和 FFmpeg：
+
+```text
+微信聊天档案 完整语音版/
+├─ 启动微信聊天档案.cmd
+├─ 诊断启动.cmd
+├─ app/                       Python 程序及 web/static 静态资源
+├─ runtime/                   基础 Python 与依赖
+├─ voice-runtime/             CPU 语音 Python 与依赖
+├─ models/small.pt            本地识别模型
+├─ tools/ffmpeg.exe           音频转换工具
+├─ prerequisites/             原生依赖说明与可选离线安装器
+├─ licenses/                  CPython、前端、后端、模型和工具许可
+├─ README.md
+├─ requirements-*.lock
+├─ release-manifest.json      实际依赖版本、资源及安装器清单
+└─ local_data/                运行后创建；发行 ZIP 排除
+```
+
+发布采用普通随包 CPython 执行 Python 文件，未冻结为单个 EXE。用户电脑只运行包内解释器和静态前端，不运行 npm 或 Vite。构建复制显式程序文件与静态资源，并收集第三方许可；ZIP 根据发布清单生成，排除 `local_data` 和编译缓存。已使用目录不要直接整体压缩替代此流程。
+
+只改应用代码、静态资源或 README，且运行依赖未变化时，可更新已有包：
+
+```powershell
+# 改动前端时先构建；只改后端或 README 时可以跳过此行
+npm --prefix frontend run build
+python scripts/build_portable.py --output "dist/微信聊天档案 完整语音版" --resources-only
+```
+
+基础版按同样方式单独同步；需要发行时再运行对应的 ZIP 命令。`--resources-only` 更新程序、静态资源、文档和清单，不安装新的运行依赖。依赖声明变化后使用完整构建命令。根目录启动入口执行 `dist` 的程序副本，因此更新源码、更新运行副本和更新 ZIP 是三个明确步骤；仅修改源码不会让该入口自动生效。
+
+### 资源定位与升级
+
+| 资源 | 默认定位 |
+|---|---|
+| 程序文件 | `runtime_paths.resource_root()`：源码目录或包内 `app/` |
+| 便携根目录 | 包含 `runtime/` 的根目录；可由 `WECHAT_ARCHIVE_HOME` 指定 |
+| 持久数据 | 包根目录或工作区的 `local_data/`；可由 `WECHAT_ARCHIVE_DATA_DIR` 指定 |
+| 模型 | 包根目录 `models/`，或账号配置明确选择的本地模型 |
+| 日志 | 实际数据目录的 `logs/` |
+| 密钥工具解释器 | 优先使用包内 `runtime/python.exe` |
+| 语音解释器 | 包内 `voice-runtime/python.exe`；高级开发场景可用 `WECHAT_ARCHIVE_VOICE_PYTHON` 指定 |
+
+资源定位不依赖终端当前工作目录。升级先正常退出，替换程序与运行时，保留实际使用的 `local_data`；外部源库、手选密钥及外部模型继续按配置路径访问。删除 ZIP 不影响已经解压的应用；使用工作区根目录快捷入口时，需要保留它依赖的 `dist` 应用目录。
+
+### 验证入口
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -83,10 +319,25 @@ python scripts/benchmark_search.py
 
 界面 fixture 只生成临时合成数据库，监听 `127.0.0.1:8767`，不检测真实微信目录。默认合成群包含“报销”“合同”和一条成功转写。CLI 仍支持 `run.py list --db <明文目录>`、`run.py export --db <明文目录> --contact <关键词>` 或 `--all --out <目录>`。
 
+| 验证位置 | 覆盖内容 |
+|---|---|
+| `tests/test_search.py`、`test_analysis.py` | 两字正文、转写、分析统计、组合筛选及原文回查口径 |
+| `tests/test_maintenance.py`、`test_selective_import.py`、`test_import_performance.py` | 账号隔离、历史保留、选择性处理、变化更新与事务发布 |
+| `tests/test_desktop.py`、`test_launcher.py`、`test_view_state.py` | 路径、子进程入口、保存、关闭、实例锁及账号阅读状态 |
+| `tests/test_usability.py`、`test_web_http.py`、`test_export_invariants.py` | 会话检索、日期、HTTP 流程和导出 |
+| `tests/test_encrypted_wal.py` | 合成加密数据库和 WAL 行为 |
+| `scripts/probe_native.py`、`probe_voice.py`、`probe_upgrade.py` | 按脚本参数执行实际原生交互、语音与升级验证 |
+| `scripts/probe_analysis.py`、`benchmark_search.py` | 合成分析范围和检索性能探测 |
+| `scripts/report_release.py` | 检查发行 ZIP 清单并报告实际文件、依赖和原生安装器信息 |
+
 ## 使用边界
 
 当前支持已实现的微信 4.x 结构，不支持微信 3.x；档案和统计反映已经导入的数据。群关联只覆盖已收录历史发送者，无法据此推断完整成员。源库未记录的撤回不会被推断补写。
 
-干净 Windows、无预装原生运行库的最终验收需要另一台机器；本机开发及随包运行测试不等同于该验收。确切证据和剩余步骤集中列在 [验收记录](docs/acceptance.md)。
+当前消息分页采用 OFFSET，上下文定位先读取会话的有序消息标识；分析在请求中载入范围消息并计算统计；需要识别的语音逐条启动 worker 并加载模型。超大范围分析和批量语音会受内存、查询及模型加载成本影响，不能把单会话合成测量外推为全库性能。
+
+接口测试、源码运行、已构建目录运行及发行 ZIP 检查分别支持各自的结论。干净 Windows、无预装原生运行库的最终验收需要另一台机器；本机开发及随包运行测试不等同于该验收。外部验收应在中文空格路径解压，按需离线补齐原生组件，走通目录选择、导入、检索、分析回查、两种导出、CPU 语音、维护中关闭，以及保留数据后的程序替换与重启。
 
 密钥工具源自 [TANGandXUE/wcdb-key-tool](https://github.com/TANGandXUE/wcdb-key-tool)，第三方运行依赖许可随发布包提供。公开再分发前需确认项目源码及上游工具的再分发授权。
+
+完整语音包中的 FFmpeg 使用 GPL 构建，许可、构建参数和源码来源随包保存。公开分发实际二进制时，还需满足它及所链接组件的对应源码交付条件；仅记录链接不等于完成全部再分发义务。
