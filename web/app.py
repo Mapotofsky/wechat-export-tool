@@ -370,7 +370,8 @@ class AnalysisFilters(BaseModel):
     start: int | None = None
     end: int | None = None
     terms: list[str] = Field(default_factory=list)
-    term_mode: Literal['text', 'word', 'phrase'] = 'text'
+    term_mode: Literal['text', 'word', 'phrase', 'expression'] = 'text'
+    independent_terms: bool = False
 
 
 class AnalysisWindow(BaseModel):
@@ -384,9 +385,11 @@ class AnalysisReq(AnalysisWindow):
     q: str = ''
     include_transcripts: bool = True
     filters: AnalysisFilters = Field(default_factory=AnalysisFilters)
+    evidence_filters: AnalysisFilters = Field(default_factory=AnalysisFilters)
     comparison: AnalysisWindow = Field(default_factory=AnalysisWindow)
     gap_minutes: int = Field(default=30, gt=0)
     keywords: list[str] = Field(default_factory=list)
+    anchor: str = ''
     session_offset: int = Field(default=0, ge=0)
     offset: int = Field(default=0, ge=0)
 
@@ -435,6 +438,47 @@ def save_analysis_blocklist(req: BlocklistReq):
         archive = analysis_archive(req.account_id)
         archive.save_config({'analysis_blocklist': rules})
     return {'saved': True, 'rules': rules}
+
+
+class AnalysisOptions(BaseModel):
+    content_only: bool = False
+    hide_numbers: bool = False
+    ignore_structured: bool = True
+    deduplicate: bool = True
+    discover: bool = True
+    complete_phrases: bool = True
+    min_phrase_messages: int = Field(default=2,ge=1,le=100)
+
+
+class AliasGroup(BaseModel):
+    id: str
+    name: str
+    members: list[str]
+    enabled: bool = True
+
+
+class AnalysisSettingsReq(BaseModel):
+    account_id: str
+    options: AnalysisOptions
+    aliases: list[AliasGroup]
+
+
+@app.get('/api/analysis/settings')
+def analysis_settings(account_id: str):
+    with manager.lock:
+        archive=analysis_archive(account_id)
+        with closing(archive.connect()) as c:
+            return analysis.analysis_context(c)
+
+
+@app.post('/api/analysis/settings')
+def save_analysis_settings(req: AnalysisSettingsReq):
+    aliases=analysis.lex.normalize_aliases([g.model_dump() for g in req.aliases])
+    with manager.lock:
+        archive=analysis_archive(req.account_id)
+        archive.save_config(dict(analysis_options=req.options.model_dump(),analysis_aliases=aliases))
+        with closing(archive.connect()) as c:
+            return analysis.analysis_context(c)
 
 
 def download(data, filename, media_type):

@@ -9,3 +9,4 @@
 .voice-manager .message{margin:12px 0}
 .voice-manager .check{flex-wrap:wrap}
 .voice-selection{max-height:230px;overflow:auto;margin:10px 0}
+.session-scroll [data-chat-index]>.chat-row{height:100%;min-height:0}.session-scroll .reason{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}

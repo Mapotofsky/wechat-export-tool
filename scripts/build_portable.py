@@ -18,7 +18,7 @@ PREREQUISITES = {
     'NDP48-x86-x64-AllOS-ENU.exe': 'https://go.microsoft.com/fwlink/?linkid=2088631',
     'VC_redist.x64.exe': 'https://aka.ms/vs/17/release/vc_redist.x64.exe',
 }
-PROGRAM_FILES = ('archive_store.py', 'archive_analysis.py', 'encrypted_sync.py', 'local_asr.py', 'maintenance.py',
+PROGRAM_FILES = ('archive_store.py', 'archive_analysis.py', 'analysis_lexicon.py', 'encrypted_sync.py', 'local_asr.py', 'maintenance.py',
     'voice_service.py', 'wcdb_key_tool_windows.py', 'wechat_export.py', 'run.py',
     'runtime_paths.py', 'desktop.py')
 

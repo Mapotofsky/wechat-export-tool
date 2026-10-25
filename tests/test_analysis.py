@@ -91,13 +91,13 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(response['overview']['calendar_days'], 1)
             self.assertEqual(web.analyze_messages(req)['total'], day['count'])
         for word in result['content']['words']:
-            req = self.req(filters={'terms':[word['term']],'term_mode':'word'})
+            req = self.req(filters={'terms':[word['term']],'term_mode':'expression'})
             self.assertEqual(web.analyze_messages(req)['total'], word['count'])
         for phrase in result['content']['phrases']:
-            req = self.req(filters={'terms':[phrase['term']],'term_mode':'phrase'})
+            req = self.req(filters={'terms':[phrase['term']],'term_mode':'expression'})
             self.assertEqual(web.analyze_messages(req)['total'], phrase['count'])
-        for pair in result['content']['cooccurrences']:
-            req = self.req(filters={'terms':pair['terms'],'term_mode':'word'})
+        for pair in web.analyze(self.req(anchor='合同'))['content']['associations']:
+            req = self.req(filters={'terms':pair['terms'],'term_mode':'expression','independent_terms':True})
             self.assertEqual(web.analyze_messages(req)['total'], pair['count'])
 
     def test_system_notices_are_separate_from_people_in_existing_archives(self):
@@ -177,7 +177,7 @@ class AnalysisTests(unittest.TestCase):
             web.save_analysis_blocklist(web.BlocklistReq(account_id='a',rules=[]))
         self.assertNotIn('analysis_blocklist',other.config())
 
-    def test_removing_single_character_rule_restores_word_and_never_joins_phrases(self):
+    def test_removed_exclusion_restores_frequency_and_never_joins_phrases(self):
         self.add('b',4,3000,'合同 的 报销')
         self.add('b',5,3060,'合同 的 报销')
         req = self.req(filters={'username':'b','start':self.start+3000,'end':self.start+3060})
@@ -188,6 +188,7 @@ class AnalysisTests(unittest.TestCase):
         self.archive.save_config({'analysis_blocklist':[]})
         result = web.analyze(req)
         self.assertIn('的',[w['term'] for w in result['content']['words']])
+        self.assertEqual(self.archive.search('b', q='的')['total'], 2)
 
     def test_comparison_windows_and_empty_results(self):
         a,b = self.start,self.start+86399
@@ -202,6 +203,95 @@ class AnalysisTests(unittest.TestCase):
         empty = web.analyze(self.req(q='不存在的合成词'))
         self.assertEqual(empty['overview']['total'],0)
         self.assertEqual(empty['sessions'],[])
+
+    def test_content_discovery_natural_chat_and_evidence(self):
+        with closing(self.archive.connect()) as c, c:
+            c.execute('DELETE FROM messages')
+        self.archive.save_config({'analysis_blocklist':analysis.DEFAULT_BLOCKLIST})
+        texts = ['就不也的了啊', 'FF14和OpenAI的API不支持批量导出，合同没收到。税',
+                 'API不支持批量导出，合同没收到，检查采样率。',
+                 '语音识别需要检查采样率，解码失败请保留日志。',
+                 '语音识别需要检查采样率，合同没收到。', '收到']
+        for i, text in enumerate(texts):
+            self.add('a', 300+i, i*60, text)
+        req=web.AnalysisReq(account_id='a',usernames=['a'])
+        r=web.analyze(req)
+        words={x['term'] for x in r['content']['words']}
+        phrases={x['term'] for x in r['content']['phrases']} | {n['term'] for x in r['content']['phrases'] for n in x.get('nested',[])}
+        self.assertTrue({'ff14','openai','api','合同','采样率','税'} <= words, words)
+        self.assertTrue({'不支持','没收到'} <= phrases, phrases)
+        self.assertIn('不',words)
+        for item in r['content']['words']+r['content']['phrases']:
+            messages=web.analyze_messages(req.model_copy(update={'filters':web.AnalysisFilters(terms=[item['term']],term_mode='expression')}))
+            self.assertEqual(item['count'],messages['total'])
+            self.assertTrue(all(item['term'] in m['content'].lower() for m in messages['messages']))
+        segment=r['sessions'][0]
+        self.assertEqual((segment['total'],segment['count']),(6,6))
+        self.assertNotEqual(segment['snippet'],'收到')
+        self.assertTrue(any('采样率' in e['snippet'] for e in segment['evidence']))
+        evidence=web.analyze_messages(req.model_copy(update={'evidence_filters':web.AnalysisFilters(terms=['合同'],term_mode='expression')}))
+        self.assertEqual(evidence['total'],3)
+        self.assertTrue(all('合同' in m['content'] for m in evidence['samples']))
+        self.assertEqual(len({m['content'] for m in evidence['samples']}),len(evidence['samples']))
+        # 旁侧线索与原分析筛选取交集，不覆盖已有关键词或绝对日期条件。
+        intersect=req.model_copy(update={'filters':web.AnalysisFilters(terms=['采样率'],start=self.start+120,term_mode='text'),
+                                        'evidence_filters':web.AnalysisFilters(terms=['合同'],term_mode='expression')})
+        self.assertEqual(web.analyze_messages(intersect)['total'],2)
+        # 标点、空格和被排除的分词都不能被删除后拼成假短语。
+        self.assertNotIn('导出合同',phrases)
+        assoc=web.analyze(req.model_copy(update={'anchor':'合同'}))['content']['associations']
+        self.assertTrue(any(x['term']=='api' for x in assoc),assoc)
+        for pair in assoc:
+            result=web.analyze_messages(req.model_copy(update={'filters':web.AnalysisFilters(terms=pair['terms'],term_mode='expression',independent_terms=True)}))
+            self.assertEqual(result['total'],pair['count'])
+        # 完整规则只排除完整表达，包含规则作用于内部文本；普通搜索不受影响。
+        self.archive.save_config({'analysis_blocklist':[dict(text='支持',mode='exact')]})
+        self.assertGreater(web.analyze_messages(req.model_copy(update={'filters':web.AnalysisFilters(terms=['不支持'],term_mode='expression')}))['total'],0)
+        self.archive.save_config({'analysis_blocklist':[dict(text='支持',mode='contains')]})
+        self.assertNotIn('不支持',{x['term'] for x in web.analyze(req)['content']['phrases']})
+        self.assertEqual(self.archive.search('a',q='不支持')['total'],2)
+
+    def test_associations_are_not_limited_to_global_top_thirty(self):
+        rows=[]
+        for i in range(40):
+            for _ in range(3):
+                rows.append(dict(content='content'+str(i),type=1))
+        rows.extend([dict(content='rareanchor rarecompanion',type=1) for _ in range(2)])
+        for i,m in enumerate(rows):
+            m.update(username='a',message_id=str(i),day='2026-10-19',query_match=True)
+        content=analysis.content_stats(rows,[],True,False,anchor='rareanchor')
+        pair=next(p for p in content['associations'] if p['term']=='rarecompanion')
+        self.assertEqual((pair['count'],pair['anchor_count'],pair['term_count']),(2,2,2))
+        self.assertEqual(pair['dice'],1)
+
+    def test_two_period_content_denominators_filters_and_sparse(self):
+        with closing(self.archive.connect()) as c, c:
+            c.execute('DELETE FROM messages')
+        for i in range(20):
+            self.add('a',400+i,-86400+i*60,'合同审批' if i<2 else '周末运动')
+        for i in range(10):
+            self.add('a',500+i,i*60,'合同审批' if i<6 else '周末运动')
+        self.add('a',600,700,'[图片]',kind=3)
+        self.add('a',601,800,'[语音]',kind=34)
+        self.archive.save_transcript('a','server:601',b'period','success','合同审批')
+        self.add('a',602,900,'[语音]',kind=34)
+        self.archive.save_transcript('a','server:602',b'failed','failed','合同审批')
+        for include in (True,False):
+            for scope in (['a'],['a','b']):
+                req=web.AnalysisReq(account_id='a',usernames=scope,start=self.start,end=self.start+86399,include_transcripts=include,filters={'sender_key':'peer'})
+                r=web.analyze(req);compare=r['content']['comparison']
+                self.assertEqual((compare['current_total'],compare['previous_total']),(11 if include else 10,20))
+                term=next(t for t in compare['items'] if t['term']=='合同')
+                self.assertEqual((term['current'],term['previous']),(7 if include else 6,2))
+                self.assertAlmostEqual(term['percentage_points'],100*((7/11 if include else 6/10)-2/20))
+                for side in ('current','previous'):
+                    v=req.model_dump();v['filters']['terms']=['合同'];v['filters']['term_mode']='expression'
+                    if side=='previous':v.update(start=compare['start'],end=compare['end'])
+                    self.assertEqual(web.analyze_messages(web.AnalysisReq(**v))['total'],term[side])
+                filtered=web.analyze(req.model_copy(update={'q':'合同'}))['content']['comparison']
+                self.assertEqual(filtered['previous_total'],2)
+                self.assertFalse(filtered['sufficient'])
+                self.assertEqual(filtered['items'],[])
 
     def test_http_validation_and_blocklist_management(self):
         with TestClient(web.app) as client:

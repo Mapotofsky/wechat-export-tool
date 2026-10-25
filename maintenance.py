@@ -134,6 +134,8 @@ class Manager:
         if account:
             archive = self.archive()
             config = archive.config()
+            # 会话接口提供通讯录；定时状态轮询不重复传输整份目录。
+            config.pop('contact_directory', None)
             config['asr_api_key_set'] = bool(config.pop('asr_api_key', ''))
         with self.lock:
             if self.task and account and self.task['account_id'] == account['id']:
