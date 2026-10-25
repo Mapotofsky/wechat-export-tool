@@ -6,6 +6,8 @@ Windows 本地桌面工作台，用于维护微信 4.x 聊天档案、阅读、�
 
 技术报告：[分析等待与内存占用改进](docs/analysis-performance-improvement-report.md)，包含复杂度、数据结构、真实只读测量和验证边界；对应[验收记录](docs/analysis-improvement-acceptance.md)。
 
+后续开发：[易用性改进方案](docs/usability-improvement-plan.md)覆盖首次准备、账号目录、批量操作、清理、任务取消与便携恢复；属于待开发规格，不代表当前行为已经改变。
+
 ## 使用便携版
 
 解压基础包或完整语音包到可写目录，双击 **启动微信聊天档案.cmd**。用户电脑无需 Python、Conda、Node，也不运行开发服务器。保留整个文件夹结构；不要直接在 ZIP 内运行。
