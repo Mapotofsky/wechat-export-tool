@@ -28,6 +28,7 @@ https://github.com/TANGandXUE/wcdb-key-tool
 from __future__ import annotations
 
 import argparse
+import csv
 import ctypes
 import glob
 import hashlib
@@ -170,24 +171,41 @@ WINDOWS_CONFIG_BLOB_MAX = 1024
 WINDOWS_CONFIG_LITERAL_RE = re.compile(rb"[xX]'([0-9a-fA-F]{64,192})'")
 
 
-def _get_pids_windows() -> list[tuple[int, int]]:
+def decode_output(output):
+    if isinstance(output, str):
+        return output
+    for encoding in ('utf-8', 'gbk', 'cp1252'):
+        try:
+            return output.decode(encoding)
+        except UnicodeDecodeError:
+            pass
+    return output.decode('utf-8', errors='replace')
+
+
+def _get_pids_windows(diagnostic=None) -> list[tuple[int, int]]:
     r = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
-        capture_output=True, text=True,
+        capture_output=True,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
     pids: list[tuple[int, int]] = []
-    for line in r.stdout.strip().split("\n"):
+    if diagnostic is not None:
+        diagnostic.update(stage='process_list', process_list_returncode=r.returncode, processes=0)
+    if r.returncode:
+        raise RuntimeError(f'tasklist 执行失败，退出码 {r.returncode}')
+    for line in decode_output(r.stdout).strip().split("\n"):
         if not line.strip():
             continue
-        p = line.strip('"').split('","')
+        p = next(csv.reader([line.strip()]))
         if len(p) >= 5:
             pid = int(p[1])
-            mem = int(p[4].replace(",", "").replace(" K", "").strip() or "0")
+            mem = int(''.join(re.findall(r'[0-9]', p[4])) or '0')
             pids.append((pid, mem))
     if not pids:
         raise RuntimeError("Weixin.exe 未运行")
     pids.sort(key=lambda x: x[1], reverse=True)
+    if diagnostic is not None:
+        diagnostic.update(stage='scan', processes=len(pids))
     for pid, mem in pids:
         _print(f"[+] Weixin.exe PID={pid} ({mem // 1024}MB)")
     return pids
@@ -241,7 +259,7 @@ def _iter_windows_region_chunks(
             data = tail + chunk
             if data:
                 yield data_base, data
-                if overlap:
+                if overlap and len(chunk) == current_size:
                     tail = data[-overlap:]
                     tail_base = data_base + max(0, len(data) - len(tail))
                 else:
@@ -422,13 +440,17 @@ def _scan_windows_v411_config_cipher(
     return stats
 
 
-def _scan_memory_raw_key(db_dir: str, keys_file: str) -> dict:
+def _scan_memory_raw_key(db_dir: str, keys_file: str, diagnostic=None) -> dict:
     """提取 Windows 微信数据库密钥。
 
     先尝试 Windows 4.1+ 的只读 runtime Config.Cipher 扫描，再回退到老版本
     raw key 内存扫描。
     """
     db_files, salt_to_dbs = collect_db_files(db_dir)
+    diagnostic = diagnostic if diagnostic is not None else {}
+    diagnostic.update(stage='scan', databases=len(db_files), opened_processes=0, open_errors=[],
+                      readable_regions=0, readable_bytes=0, skipped_regions=0, skipped_bytes=0,
+                      read_failures=0, candidate_count=0)
     if not db_files:
         raise RuntimeError(f"在 {db_dir} 未找到可解密的 .db 文件")
     _print(f"找到 {len(db_files)} 个数据库, {len(salt_to_dbs)} 个不同的 salt")
@@ -448,26 +470,31 @@ def _scan_memory_raw_key(db_dir: str, keys_file: str) -> dict:
     def read_mem(h, addr, sz):
         buf = ctypes.create_string_buffer(sz)
         n = ctypes.c_size_t(0)
-        if kernel32.ReadProcessMemory(h, ctypes.c_uint64(addr), buf, sz, ctypes.byref(n)):
-            return buf.raw[: n.value]
-        return None
+        ok = kernel32.ReadProcessMemory(h, ctypes.c_uint64(addr), buf, sz, ctypes.byref(n))
+        if not ok:
+            diagnostic['read_failures'] += 1
+        return buf.raw[:n.value] if n.value else None
 
-    def enum_regions(h):
+    def enum_regions(h, record=True):
         regs = []
         addr = 0
         mbi = MBI()
         while addr < 0x7FFFFFFFFFFF:
             if kernel32.VirtualQueryEx(h, ctypes.c_uint64(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)) == 0:
                 break
-            if mbi.State == MEM_COMMIT and mbi.Protect in READABLE and 0 < mbi.RegionSize < 500 * 1024 * 1024:
+            if mbi.State == MEM_COMMIT and mbi.Protect in READABLE and mbi.RegionSize > 0:
                 regs.append((mbi.BaseAddress, mbi.RegionSize))
+            elif record:
+                diagnostic['skipped_regions'] += 1
+                diagnostic['skipped_bytes'] += mbi.RegionSize
             nxt = mbi.BaseAddress + mbi.RegionSize
             if nxt <= addr:
                 break
             addr = nxt
         return regs
 
-    pids = _get_pids_windows()
+    pids = _get_pids_windows(diagnostic)
+    diagnostic['processes'] = len(pids)
     key_map: dict[str, str] = {}
     remaining_salts = set(salt_to_dbs.keys())
     t0 = time.time()
@@ -476,10 +503,14 @@ def _scan_memory_raw_key(db_dir: str, keys_file: str) -> dict:
     for pid, _mem_kb in pids:
         h = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
         if not h:
+            diagnostic['open_errors'].append(kernel32.GetLastError())
             _print(f"[WARN] 无法打开进程 PID={pid}，跳过（尝试以管理员身份运行）")
             continue
         try:
+            diagnostic['opened_processes'] += 1
             regions = enum_regions(h)
+            diagnostic['readable_regions'] += len(regions)
+            diagnostic['readable_bytes'] += sum(size for _, size in regions)
             runtime_stats.append(_scan_windows_v411_config_cipher(
                 pid,
                 regions,
@@ -491,11 +522,14 @@ def _scan_memory_raw_key(db_dir: str, keys_file: str) -> dict:
                 remaining_salts,
                 _print,
             ))
+            diagnostic['candidate_count'] += runtime_stats[-1]['candidate_count']
+            for name in ('needle_occurrences', 'string_object_refs', 'node_candidates', 'verified_candidates'):
+                diagnostic[name] = sum(stats.get(name, 0) for stats in runtime_stats)
         finally:
             kernel32.CloseHandle(h)
         if not remaining_salts:
             _print("[+] Windows 4.1 runtime Config.Cipher scan covered all databases")
-            _save_results(db_files, salt_to_dbs, key_map, db_dir, keys_file)
+            _save_results(db_files, salt_to_dbs, key_map, db_dir, keys_file, diagnostic)
             return key_map
 
     if key_map:
@@ -509,13 +543,13 @@ def _scan_memory_raw_key(db_dir: str, keys_file: str) -> dict:
             _print(f"[WARN] 无法打开进程 PID={pid}，跳过（尝试以管理员身份运行）")
             continue
         try:
-            for base, size in enum_regions(h):
+            for base, data in _iter_windows_region_chunks(enum_regions(h, record=False), lambda addr, size: read_mem(h, addr, size), overlap=195):
                 if not remaining_salts:
                     break
-                data = read_mem(h, base, size)
                 if not data:
                     continue
                 for m in _HEX_RE.finditer(data):
+                    diagnostic['candidate_count'] += 1
                     hex_str = m.group(1).decode()
                     if len(hex_str) < 96:
                         continue
@@ -541,7 +575,7 @@ def _scan_memory_raw_key(db_dir: str, keys_file: str) -> dict:
             "runtime Config.Cipher 扫描，再回退到老版本内存扫描；如果仍失败，请确认"
             "微信已登录并且数据库目录正确。"
         )
-    _save_results(db_files, salt_to_dbs, key_map, db_dir, keys_file)
+    _save_results(db_files, salt_to_dbs, key_map, db_dir, keys_file, diagnostic)
     return key_map
 
 
@@ -598,10 +632,12 @@ def check_cdb_prerequisites() -> list[str]:
 def _find_wechat_pid_windows() -> int | None:
     r = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
-        capture_output=True, text=True,
+        capture_output=True,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )
-    for line in r.stdout.strip().split("\n"):
+    if r.returncode:
+        raise RuntimeError(f'tasklist 执行失败，退出码 {r.returncode}')
+    for line in decode_output(r.stdout).strip().split("\n"):
         if not line.strip():
             continue
         parts = line.strip('"').split('","')
@@ -654,6 +690,7 @@ def capture_passphrase_experimental(pid: int | None = None, timeout: int = DEFAU
     proc = subprocess.Popen(
         ["cdb", "-p", str(pid), "-c", cdb_cmd],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        encoding='utf-8', errors='replace', creationflags=subprocess.CREATE_NO_WINDOW,
     )
     buf = ""
     deadline = time.time() + timeout
@@ -757,7 +794,15 @@ def _get_key_info(keys: dict, rel_path: str) -> dict | None:
     return None
 
 
-def _save_results(db_files: list, salt_to_dbs: dict, key_map: dict, db_dir: str, out_file: str) -> None:
+def _save_results(db_files: list, salt_to_dbs: dict, key_map: dict, db_dir: str, out_file: str, diagnostic=None) -> None:
+    if diagnostic is not None:
+        diagnostic.update(stage='validation', databases=len(db_files),
+                          verified_databases=sum(s in key_map for _, _, _, s, _ in db_files))
+        for category in ('contact', 'message', 'other'):
+            diagnostic['missing_' + category + '_databases'] = sum(
+                salt not in key_map and (rel.replace('\\','/').split('/')[0]
+                    if rel.replace('\\','/').split('/')[0] in ('contact','message') else 'other') == category
+                for rel, _, _, salt, _ in db_files)
     _print(f"\n{'=' * 60}")
     _print(f"结果: {len(key_map)}/{len(salt_to_dbs)} salts 找到密钥")
 
@@ -773,22 +818,26 @@ def _save_results(db_files: list, salt_to_dbs: dict, key_map: dict, db_dir: str,
         raise RuntimeError("未能提取到任何密钥")
 
     result["_db_dir"] = db_dir
+    if diagnostic is not None:
+        diagnostic['stage'] = 'write_result'
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     _print(f"\n密钥保存到: {out_file}")
+    if diagnostic is not None:
+        diagnostic['stage'] = 'complete'
 
 
 # ============================================================
 # Config Detection（读微信本地 ini 配置定位数据目录）
 # ============================================================
 
-def auto_detect_db_dir() -> str | None:
+def candidate_db_dirs() -> list[str]:
     """读取 %APPDATA%\\Tencent\\xwechat\\config\\*.ini 找到数据根目录，
     再匹配 xwechat_files\\*\\db_storage。"""
     appdata = os.environ.get("APPDATA", "")
     config_dir = os.path.join(appdata, "Tencent", "xwechat", "config")
     if not os.path.isdir(config_dir):
-        return None
+        return []
 
     data_roots: list[str] = []
     for ini_file in glob.glob(os.path.join(config_dir, "*.ini")):
@@ -809,6 +858,11 @@ def auto_detect_db_dir() -> str | None:
             if os.path.isdir(match) and match not in candidates:
                 candidates.append(match)
 
+    return candidates
+
+
+def auto_detect_db_dir() -> str | None:
+    candidates = candidate_db_dirs()
     return candidates[0] if candidates else None
 
 
@@ -931,6 +985,20 @@ def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
 # ============================================================
 
 def cmd_extract(args: argparse.Namespace) -> None:
+    diagnostic = {'stage': 'preflight', 'verified_databases': 0}
+    try:
+        _cmd_extract(args, diagnostic)
+    except BaseException as exc:
+        diagnostic.update(exception_type=type(exc).__name__,
+                          system_code=getattr(exc, 'winerror', None) or getattr(exc, 'errno', None))
+        raise
+    finally:
+        if getattr(args, 'diagnostic', None):
+            with open(args.diagnostic, 'w', encoding='utf-8') as stream:
+                json.dump(diagnostic, stream)
+
+
+def _cmd_extract(args: argparse.Namespace, diagnostic) -> None:
     db_dir = args.db_dir or auto_detect_db_dir()
     if not db_dir:
         _print("[ERROR] 未能自动检测微信数据库目录，请使用 --db-dir 手动指定")
@@ -938,6 +1006,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
     _print(f"[*] 数据库目录: {db_dir}")
 
     db_files, salt_to_dbs = collect_db_files(db_dir)
+    diagnostic['databases'] = len(db_files)
     if not db_files:
         _print(f"[ERROR] 在 {db_dir} 未找到可解密的 .db 文件")
         sys.exit(1)
@@ -951,14 +1020,14 @@ def cmd_extract(args: argparse.Namespace) -> None:
         key_map = _derive_keys_from_passphrase(bytes.fromhex(passphrase_hex), db_files, salt_to_dbs)
         if key_map:
             _print(f"[+] passphrase 派生成功: {len(key_map)}/{len(salt_to_dbs)} 密钥")
-            _save_results(db_files, salt_to_dbs, key_map, db_dir, out_file)
+            _save_results(db_files, salt_to_dbs, key_map, db_dir, out_file, diagnostic)
             if args.decrypt:
                 decrypt_all(db_dir, "decrypted", out_file)
             return
         _print("[!] 已保存的 passphrase 无效，改走内存扫描")
 
     # 第 2 级：内存扫描 raw key（仅对仍缓存明文密钥的微信版本有效）
-    _scan_memory_raw_key(db_dir, out_file)
+    _scan_memory_raw_key(db_dir, out_file, diagnostic)
     if args.decrypt:
         decrypt_all(db_dir, "decrypted", out_file)
 
@@ -1007,6 +1076,10 @@ def cmd_decrypt(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # Desktop captures bytes; make tool output independent of Windows ANSI locale.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
     parser = argparse.ArgumentParser(description="wcdb-key-tool (Windows) — 微信数据库密钥提取工具")
     parser.add_argument("--verbose", "-v", action="store_true")
     sub = parser.add_subparsers(dest="command", metavar="command")
@@ -1015,6 +1088,7 @@ def main() -> None:
     extract_cmd = sub.add_parser("extract", help="提取数据库密钥（老版本内存扫描 / 新版 runtime Config.Cipher 扫描）")
     extract_cmd.add_argument("--db-dir", help="微信 db_storage 目录（默认自动检测）")
     extract_cmd.add_argument("--output", default="all_keys.json")
+    extract_cmd.add_argument('--diagnostics-output', '--diagnostic', dest='diagnostic', help='不含密钥或内存原文的诊断 JSON')
     extract_cmd.add_argument("--decrypt", action="store_true")
 
     capture_cmd = sub.add_parser(

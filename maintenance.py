@@ -17,6 +17,34 @@ import wechat_export as we
 from runtime_paths import python_executable, resource_root
 
 
+def extraction_feedback(diagnostic, returncode, output_exists):
+    total = diagnostic.get('databases', 0)
+    verified = diagnostic.get('verified_databases', 0)
+    if diagnostic.get('exception_type') in ('UnicodeEncodeError', 'UnicodeDecodeError'):
+        return 'output_failed', '工具输出编码失败，请查看本次诊断后重试'
+    if diagnostic.get('stage') == 'preflight' and diagnostic.get('system_code'):
+        return 'file_read_failed', '数据库文件读取失败，请按诊断中的系统错误码检查源目录后重试'
+    if diagnostic.get('databases') == 0:
+        return 'no_databases', '未找到可验证的数据库，请重新检查所选源目录'
+    if diagnostic.get('process_list_returncode'):
+        return 'process_list_failed', '进程列表命令执行失败，请查看退出码并重试'
+    if diagnostic.get('stage') == 'write_result' or (diagnostic.get('stage') == 'complete' and not output_exists):
+        return 'write_failed', '结果文件未写入，请检查数据目录可写性和剩余空间后重试'
+    if diagnostic.get('open_errors') and not diagnostic.get('opened_processes') and 5 in diagnostic['open_errors']:
+        return 'access_denied', '系统拒绝读取微信进程，可尝试以管理员身份启动本工具后重试'
+    if total and 0 < verified < total and output_exists and not returncode:
+        return 'partial', f'仅验证通过 {verified}/{total} 个数据库；已保存可用密钥，可尝试准备通讯录，或核对目录后重试提取'
+    if total and verified == total and output_exists and not returncode:
+        return 'complete', f'验证通过 {verified}/{total} 个数据库；请继续准备通讯录'
+    if diagnostic.get('processes') == 0:
+        return 'not_running', '未发现运行中的微信，请登录对应账号后重试'
+    if diagnostic.get('candidate_count'):
+        return 'validation_failed', '发现候选但未通过校验；请核对当前登录账号的存储目录，确认数据库来自该目录后重试。现有证据不能确定是账号或权限问题'
+    if diagnostic.get('opened_processes'):
+        return 'no_candidates', '未取得可校验候选；请核对当前微信账号和存储目录，查看扫描覆盖及读取失败计数后重试'
+    return 'unknown', '工具未能完成诊断，未取得可用密钥；请确认微信已登录，核对当前账号存储目录后重试'
+
+
 def atomic_json(path, data):
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -41,11 +69,14 @@ def inspect_directory(directory):
     with contact.open('rb') as f:
         plain = f.read(16) == b'SQLite format 3\x00'
     return {'directory': str(path), 'mode': 'plaintext' if plain else 'encrypted',
+            'account_directory': path.parent.name if path.name == 'db_storage' else path.name,
             'message_shards': len(messages),
             'wal_files': sum(Path(str(p) + '-wal').exists() for p in [contact] + messages)}
 
 
 def identity_candidates(directory, query):
+    if not query.strip():
+        raise ValueError('请输入微信号、内部 username、昵称或备注')
     path = Path(directory) / 'contact' / 'contact.db'
     if not path.is_file():
         raise ValueError('请先解密准备数据，再查找与确认身份')
@@ -53,8 +84,9 @@ def identity_candidates(directory, query):
         columns = {r[1] for r in c.execute('PRAGMA table_info(contact)')}
         alias = 'alias' if 'alias' in columns else "'' AS alias"
         rows = c.execute(f'SELECT username,{alias},remark,nick_name FROM contact WHERE username=?' +
-                         (' OR alias=?' if 'alias' in columns else ''),
-                         (query, query) if 'alias' in columns else (query,)).fetchall()
+                         (' OR alias=?' if 'alias' in columns else '') +
+                         ' OR instr(remark,?)>0 OR instr(nick_name,?)>0',
+                         (query, query, query, query) if 'alias' in columns else (query, query, query)).fetchall()
         candidates = [{'username': u, 'alias': a, 'name': r or n or u, 'basis': 'contact.alias/username'}
                       for u, a, r, n in rows]
     # Explicit internal usernames may exist only in a shard's Name2Id.
@@ -120,6 +152,8 @@ class Manager:
             if not account:
                 account = dict(info, id=uuid.uuid4().hex, label=label.strip())
                 self.registry['accounts'].append(account)
+            else:
+                account.update(info)
             self.registry['active'] = account['id']
             atomic_json(self.registry_path, self.registry)
             archive = self.archive()
@@ -131,9 +165,11 @@ class Manager:
     def status(self):
         account = self.account()
         config, task = {}, None
+        setup = None
         if account:
             archive = self.archive()
             config = archive.config()
+            setup = self.setup(account, config)
             # 会话接口提供通讯录；定时状态轮询不重复传输整份目录。
             config.pop('contact_directory', None)
             config['asr_api_key_set'] = bool(config.pop('asr_api_key', ''))
@@ -144,8 +180,30 @@ class Manager:
                 path = archive.directory / 'task.json'
                 if path.exists():
                     task = json.loads(path.read_text(encoding='utf-8'))
-        return {'account': account, 'accounts': self.registry['accounts'], 'config': config,
+        return {'account': account, 'accounts': self.registry['accounts'], 'config': config, 'setup': setup or self.setup(config={}),
                 'task': task, 'wal_validation': '尚未执行真实微信加密 WAL 端到端验证'}
+
+    def setup(self, account=None, config=None):
+        account = account or self.account()
+        config = config if config is not None else (self.archive(account).config() if account else {})
+        source = bool(account and (Path(account['directory']) / 'contact/contact.db').is_file()
+                      and (Path(account['directory']) / 'message').is_dir())
+        needs_keys = bool(account and account['mode'] == 'encrypted')
+        has_keys = bool(config.get('keys_file') and Path(config['keys_file']).is_file())
+        contacts_ready = bool(config.get('decrypted_dir') and
+                              'contact_directory' in config and
+                              (Path(config['decrypted_dir']) / 'contact/contact.db').is_file())
+        identity_saved = bool(config.get('self_username'))
+        has_archive = False
+        if account:
+            with closing(self.archive(account).connect()) as c:
+                has_archive = bool(c.execute('SELECT 1 FROM chats LIMIT 1').fetchone())
+        action = ('directory' if not source else 'extract' if needs_keys and (not has_keys or config.get('keys_error')) else
+                  'prepare' if not contacts_ready else 'identity' if not identity_saved else 'read')
+        return dict(directory_saved=bool(account), source_available=source, needs_keys=needs_keys,
+                    has_keys=has_keys, contacts_ready=contacts_ready, identity_saved=identity_saved, has_readable_archive=has_archive,
+                    next_action=action, blocked_reason=('源目录不可用，请重新选择目录；已有档案仍可阅读' if account and not source else
+                    config.get('keys_error') or ('请先提取密钥或保存已有密钥路径' if needs_keys and not has_keys else '')))
 
     def submit(self, action, usernames=None, group_id=None, voice_targets=None):
         with self.lock:
@@ -153,6 +211,16 @@ class Manager:
                 raise ValueError('已有维护任务正在执行，可继续查看列表和导出')
             account = dict(self.account() or {})
             archive = self.archive(account)
+            config = archive.config()
+            if action in ('extract', 'prepare', 'discover', 'update', 'update_all', 'transcribe'):
+                inspect_directory(account['directory'])
+            if action == 'extract' and account['mode'] != 'encrypted':
+                raise ValueError('明文库无需提取密钥')
+            if action != 'extract' and account['mode'] == 'encrypted' and not (
+                    config.get('keys_file') and Path(config['keys_file']).is_file()):
+                raise ValueError('请先提取密钥或保存有效的密钥文件路径')
+            if action in ('update', 'update_all') and not config.get('self_username'):
+                raise ValueError('请先查找并保存本人身份，再导入会话')
             if group_id is not None:
                 if action not in ('update', 'transcribe'):
                     raise ValueError('此任务不支持项目范围')
@@ -205,14 +273,43 @@ class Manager:
                 progress('读取微信进程并验证候选密钥')
                 # The existing tool can print identity/key details: capture and do not expose its logs.
                 keys = archive.directory / ('keys_' + uuid.uuid4().hex + '.json')
-                result = subprocess.run([str(python_executable()), str(resource_root() / 'wcdb_key_tool_windows.py'),
-                                         'extract', '--db-dir', account['directory'], '--output', str(keys)],
-                                        capture_output=True, timeout=600,
-                                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-                if result.returncode or not keys.exists():
-                    raise RuntimeError('密钥提取失败。请确认微信已登录且当前进程有读取权限，必要时以管理员身份启动后重试')
-                archive.save_config({'keys_file': str(keys)})
-                result = {'keys_saved': True}
+                diagnostic_path = keys.with_suffix('.diagnostic.json')
+                try:
+                    process = subprocess.run([str(python_executable()), str(resource_root() / 'wcdb_key_tool_windows.py'),
+                                             'extract', '--db-dir', account['directory'], '--diagnostics-output', str(diagnostic_path), '--output', str(keys)],
+                                            capture_output=True, timeout=600,
+                                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                    diagnostic = {}
+                    if diagnostic_path.exists():
+                        try:
+                            raw = json.loads(diagnostic_path.read_text(encoding='utf-8'))
+                            # Only typed counters and known stages cross the subprocess boundary.
+                            diagnostic = {k: raw[k] for k in ('databases', 'verified_databases', 'processes',
+                                'opened_processes', 'readable_regions', 'readable_bytes', 'read_failures', 'candidate_count', 'system_code', 'process_list_returncode',
+                                'skipped_regions', 'skipped_bytes', 'needle_occurrences', 'string_object_refs', 'node_candidates', 'verified_candidates',
+                                'missing_contact_databases', 'missing_message_databases', 'missing_other_databases')
+                                if type(raw.get(k)) is int}
+                            if raw.get('stage') in ('preflight', 'process_list', 'scan', 'validation', 'write_result', 'complete'):
+                                diagnostic['stage'] = raw['stage']
+                            diagnostic['open_errors'] = [n for n in raw.get('open_errors', []) if type(n) is int]
+                            if raw.get('exception_type') in ('OSError', 'PermissionError', 'FileNotFoundError', 'RuntimeError',
+                                    'ValueError', 'UnicodeEncodeError', 'UnicodeDecodeError', 'SystemExit'):
+                                diagnostic['exception_type'] = raw['exception_type']
+                        except (ValueError, TypeError):
+                            pass
+                    diagnostic['returncode'] = process.returncode
+                    code, feedback = extraction_feedback(diagnostic, process.returncode, keys.exists())
+                    task.update(diagnostic=diagnostic, diagnostic_code=code, next_step=feedback)
+                    if code not in ('complete', 'partial'):
+                        raise RuntimeError('密钥提取失败：' + feedback)
+                except subprocess.TimeoutExpired:
+                    task.update(diagnostic_code='timeout', diagnostic={'stage': 'scan', 'timeout_seconds': 600},
+                                next_step='提取超时，请核对目录后重试；此前可用档案仍保留')
+                    raise RuntimeError('TimeoutExpired：密钥提取超时（600 秒）') from None
+                finally:
+                    diagnostic_path.unlink(missing_ok=True)
+                archive.save_config({'keys_file': str(keys), 'keys_error': ''})
+                result = {'keys_saved': True, 'coverage': code, 'next_step': feedback}
             elif action in ('prepare', 'discover', 'update', 'update_all'):
                 db_dir = config.get('decrypted_dir')
                 manifest = {}
@@ -226,6 +323,7 @@ class Manager:
                     db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
                                                           config['keys_file'], [db_dir, config.get('message_snapshot'), config.get('media_snapshot')], progress,
                                                           contacts_only=action == 'prepare', media=media_needed)
+                    archive.save_config({'keys_error': ''})
                 if action in ('prepare', 'discover'):
                     archive.save_config({'decrypted_dir': str(db_dir)})
                     if account['mode'] == 'encrypted':
@@ -234,7 +332,8 @@ class Manager:
                             archive.save_config({'message_snapshot': str(snapshot)})
                     count = archive.prepare_directory(db_dir, discover=action == 'discover')
                     result = {'prepared': True, 'databases': len(manifest),
-                              'contacts': count, 'next_step': '选择并保存关注会话，确认身份后更新关注'}
+                              'contacts': count, 'next_step': ('通讯录已准备，可选择会话并导入，或继续阅读已归档消息' if config.get('self_username') else
+                              '查找并保存本人身份，再选择会话并导入；关注范围可选')}
                 else:
                     if not config.get('self_username'):
                         raise ValueError('请先查找并确认自己的内部 username')
@@ -291,10 +390,13 @@ class Manager:
                                 reason=f"{result['failed']} 条语音转写失败，具体原因见下方汇总", finished=now(),
                                 next_step='按错误汇总修复工具后重试；成功的转写会自动复用')
                 else:
-                    task.update(status='success', stage='完成', result=result, finished=now(), next_step=result.get('next_step', '可查看列表或导出'))
+                    task.update(status='success', stage='部分密钥已保存' if task.get('diagnostic_code') == 'partial' else '完成', result=result, finished=now(), next_step=result.get('next_step', '可查看列表或导出'))
         except BaseException as exc:
             logging.getLogger(__name__).exception('维护任务 %s 在 %s 失败', action, task['stage'])
             with self.lock:
+                if isinstance(exc, encrypted_sync.KeyPreparationError):
+                    archive.save_config({'keys_error': str(exc)})
+                    task.update(diagnostic_code='keys_invalid', next_step='返回数据设置，重新提取或选择密钥文件，再准备通讯录；旧档案仍可阅读')
                 # Avoid printing raw SQL values or subprocess output.
                 if isinstance(exc, OSError):
                     filename = Path(exc.filename2 or exc.filename).name if (exc.filename2 or exc.filename) else '未知文件'
@@ -305,7 +407,7 @@ class Manager:
                 frame = traceback.extract_tb(exc.__traceback__)[-1]
                 task.update(status='failed', failed_stage=task['stage'], reason=reason, finished=now(),
                             error_location=f'{Path(frame.filename).name}:{frame.lineno} · {frame.name}',
-                            next_step='按失败原因调整目录、身份或工具后重新执行；此前可用档案仍保留')
+                            next_step=task.get('next_step') or '按失败原因调整目录、身份或工具后重新执行；此前可用档案仍保留')
         finally:
             with self.lock:
                 atomic_json(task_path, task)

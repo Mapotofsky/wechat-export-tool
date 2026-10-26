@@ -43,6 +43,12 @@ async def invalid_request(request, exc):
     return JSONResponse({'detail': str(exc)}, status_code=400)
 
 
+@app.exception_handler(OSError)
+async def file_error(request, exc):
+    code = getattr(exc, 'winerror', None) or exc.errno
+    return JSONResponse({'detail': f'文件操作失败（系统错误 {code}：{exc.strerror}），请检查所选路径与访问权限后重试'}, status_code=400)
+
+
 class DirectoryReq(BaseModel):
     directory: str
 
@@ -135,6 +141,7 @@ def validate_range(start, end):
 def data_status():
     status = manager.status()
     rows = manager.archive().contacts() if manager.account() else []
+    status['setup']['has_readable_archive'] = bool(rows)
     return dict(status, has_data=bool(rows), contacts=len(rows))
 
 
@@ -146,7 +153,13 @@ def check_directory(req: DirectoryReq):
 @app.get('/api/suggest-directory')
 def suggest_directory():
     import wcdb_key_tool_windows as keys
-    return {'directory': keys.auto_detect_db_dir() or '', 'decrypted_default': str(DB_DIR),
+    candidates = []
+    for directory in keys.candidate_db_dirs():
+        try:
+            candidates.append(dict(inspect_directory(directory), account_directory=Path(directory).parent.name))
+        except (ValueError, OSError):
+            continue
+    return {'candidates': candidates, 'directory': '', 'decrypted_default': str(DB_DIR),
             'explicit': DB_SUGGESTION_EXPLICIT}
 
 
@@ -178,7 +191,7 @@ def settings(req: SettingsReq):
         path = Path(req.keys_file).expanduser().resolve()
         if not path.is_file():
             raise ValueError('密钥文件不存在')
-        values['keys_file'] = str(path)
+        values.update(keys_file=str(path), keys_error='')
     if req.asr_model is not None:
         path = Path(req.asr_model).expanduser().resolve()
         if req.asr_model and (not path.is_file() or path.suffix != '.pt'):

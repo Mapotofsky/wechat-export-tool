@@ -212,9 +212,19 @@ def file_digest(path):
     return digest.hexdigest()
 
 
+class KeyPreparationError(ValueError):
+    """The selected key file cannot prepare the requested databases."""
+
+
 def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: None, contacts_only=False, media=False):
     source, account_dir = Path(source), Path(account_dir)
-    keys = cipher._strip_key_metadata(json.loads(Path(keys_file).read_text(encoding='utf-8')))
+    try:
+        raw_keys = json.loads(Path(keys_file).read_text(encoding='utf-8'))
+        if not isinstance(raw_keys, dict):
+            raise ValueError('expected object')
+        keys = cipher._strip_key_metadata(raw_keys)
+    except (ValueError, OSError):
+        raise KeyPreparationError('密钥文件无法读取或不是有效 JSON，请重新选择密钥文件或提取密钥') from None
     files = sorted([source / 'contact' / 'contact.db'] +
                    ([] if contacts_only else [p for p in (source / 'message').glob('message_*.db') if is_message_shard(p.name)]) +
                    (list((source / 'message').glob('media_*.db')) if media else []))
@@ -252,12 +262,17 @@ def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: N
         signature = [file_digest(src), file_digest(wal) if wal.exists() else None]
         key_info = cipher._get_key_info(keys, str(rel))
         if not key_info:
-            raise ValueError(f'缺少 {rel} 的密钥，请登录微信后重新提取密钥')
+            raise KeyPreparationError(f'缺少 {rel} 的密钥，请重新提取密钥或选择包含该库的密钥文件')
         # Key authentication is done before reusing an existing decrypted snapshot.
-        key = bytes.fromhex(key_info['enc_key'])
+        try:
+            key = bytes.fromhex(key_info['enc_key'])
+            if len(key) != 32:
+                raise ValueError('invalid key length')
+        except (ValueError, KeyError, TypeError):
+            raise KeyPreparationError('密钥内容格式无效，请重新选择密钥文件或提取密钥') from None
         with src.open('rb') as f:
             if not cipher.verify_enc_key(key, f.read(cipher.PAGE_SZ)):
-                raise ValueError('当前密钥不匹配此账号的数据库，请重新提取')
+                raise KeyPreparationError('当前密钥未通过所选数据库认证，请核对目录并重新提取或选择密钥文件')
         cached = next(((directory, old[str(rel)]) for directory, old in reusable
                        if old.get(str(rel), {}).get('signature') == signature and (directory / rel).exists()), None)
         if cached:

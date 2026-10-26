@@ -2,10 +2,15 @@
 import sys
 from pathlib import Path
 import tempfile
+import os
 import sqlite3
 import io
 import wave
 from contextlib import closing
+
+# web.app constructs its Manager at import time; isolate before importing it.
+_bootstrap = tempfile.TemporaryDirectory(prefix='wechat_ui_bootstrap_')
+os.environ['WECHAT_ARCHIVE_DATA_DIR'] = str(Path(_bootstrap.name) / 'state')
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from test_maintenance import seed, shard

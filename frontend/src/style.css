@@ -10,3 +10,5 @@
 .voice-manager .check{flex-wrap:wrap}
 .voice-selection{max-height:230px;overflow:auto;margin:10px 0}
 .session-scroll [data-chat-index]>.chat-row{height:100%;min-height:0}.session-scroll .reason{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.directory-candidate{display:block;width:100%;text-align:left;white-space:normal;overflow-wrap:anywhere;margin:4px 0}
+.setup-summary{overflow-wrap:anywhere;position:sticky;top:0;z-index:2;background:#f2f8f5}.setup-summary p{margin:5px 0}

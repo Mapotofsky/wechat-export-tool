@@ -1,5 +1,6 @@
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -19,6 +20,7 @@ class DesktopTests(unittest.TestCase):
             (root / 'runtime').mkdir()
             (root / 'runtime' / 'python.exe').touch()
             with patch.dict('os.environ', {'WECHAT_ARCHIVE_HOME': str(root)}):
+                os.environ.pop('WECHAT_ARCHIVE_DATA_DIR', None)
                 self.assertEqual(runtime_paths.data_root(), root / 'local_data')
                 self.assertEqual(runtime_paths.models_root(), root / 'models')
                 self.assertEqual(runtime_paths.python_executable(), root / 'runtime' / 'python.exe')

@@ -1,6 +1,7 @@
 """Background launch contracts; no real WeChat process or external API is used."""
 from pathlib import Path
 import subprocess
+import json
 import sys
 import tempfile
 import unittest
@@ -76,6 +77,7 @@ class BackgroundProcessTests(unittest.TestCase):
                             raise subprocess.TimeoutExpired(command, 600)
                         if outcome == 'success':
                             Path(command[-1]).write_text('{}')
+                            Path(command[6]).write_text(json.dumps({'stage':'complete','databases':1,'verified_databases':1}))
                         return subprocess.CompletedProcess(command, 0 if outcome == 'success' else 4,
                                                            b'', b'synthetic private key output')
                     task = {'status': 'running'}
