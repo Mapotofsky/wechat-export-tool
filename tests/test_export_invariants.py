@@ -255,7 +255,7 @@ class ExportInvariantTests(unittest.TestCase):
             self.assertTrue(web_app.data_status()['has_data'])
             self.assertEqual(web_app.data_status()['contacts'], 1)
             self.assertEqual(web_app.contacts()[0]["username"], username)
-            response = web_app.export(web_app.ExportReq(usernames=[username]))
+            response = web_app.export(web_app.ExportReq(account_id=manager.account()['id'], usernames=[username]))
 
         async def read_body():
             return b"".join([part async for part in response.body_iterator])

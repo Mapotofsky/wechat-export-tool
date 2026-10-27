@@ -80,6 +80,7 @@ class VoiceTarget(BaseModel):
 
 
 class TaskReq(BaseModel):
+    account_id: str
     action: str
     usernames: list[str] | None = None
     group_id: str | None = None
@@ -120,6 +121,7 @@ def save_view_state(req: ViewStateReq):
 
 
 class ExportReq(BaseModel):
+    account_id: str
     usernames: list[str]
     format: str = 'zip'
     start: int | None = None
@@ -212,7 +214,18 @@ def task(req: TaskReq):
     if req.action not in ('extract', 'prepare', 'discover', 'update', 'update_all', 'transcribe'):
         raise ValueError('未知任务')
     return manager.submit(req.action, None if req.usernames is None else list(dict.fromkeys(req.usernames)), req.group_id,
-                          None if req.voice_targets is None else [t.model_dump() for t in req.voice_targets])
+                          None if req.voice_targets is None else [t.model_dump() for t in req.voice_targets], req.account_id)
+
+
+@app.post('/api/task-preview')
+def task_preview(req: TaskReq):
+    with manager.lock:
+        result = manager.operation_preview(req.action, req.usernames, req.group_id, req.account_id)
+        if req.voice_targets is not None:
+            if req.action != 'transcribe':
+                raise ValueError('仅语音转写支持消息选择')
+            manager.archive().voice_targets(result['usernames'], [t.model_dump() for t in req.voice_targets])
+        return result
 
 
 class VoiceQuery(BaseModel):
@@ -279,8 +292,17 @@ def group_scope(group_id: str):
 
 
 class HiddenReq(FollowReq):
+    account_id: str
     hidden: bool = True
     purge: bool = False
+    expected_counts: dict[str, int] | None = None
+
+
+@app.post('/api/hidden-preview')
+def hidden_preview(req: HiddenReq):
+    with manager.lock:
+        manager.require_account(req.account_id)
+        return dict(manager.archive().hidden_preview(req.usernames, req.purge), account_id=manager.account()['id'])
 
 
 @app.get('/api/hidden')
@@ -291,9 +313,83 @@ def hidden_chats():
 @app.post('/api/hidden')
 def save_hidden(req: HiddenReq):
     with manager.lock:
+        manager.require_account(req.account_id)
         if manager.busy():
             raise ValueError('请等待当前维护任务完成后隐藏、恢复或清理会话')
-        return manager.archive().set_hidden(req.usernames, req.hidden, req.purge)
+        archive = manager.archive()
+        preview = archive.hidden_preview(req.usernames, req.purge)
+        if req.purge and req.expected_counts is None:
+            raise ValueError('请先预览清理影响并核对数量')
+        if req.expected_counts is not None and preview['counts'] != req.expected_counts:
+            return dict(review_required=True, preview=dict(preview, account_id=manager.account()['id']))
+        manager.cleanup = dict(account_id=manager.account()['id'], stage='准备清理' if req.purge else '保存隐藏状态', usernames=preview['usernames'])
+    try:
+        return archive.set_hidden(preview['usernames'], req.hidden, req.purge,
+                                  lambda stage: manager.cleanup.update(stage=stage))
+    finally:
+        with manager.lock:
+            manager.cleanup = None
+
+
+@app.post('/api/reclaim-space')
+def reclaim_space(req: HiddenReq):
+    with manager.lock:
+        manager.require_account(req.account_id)
+        if manager.busy():
+            raise ValueError('请等待当前操作完成')
+        archive = manager.archive()
+        manager.cleanup = dict(account_id=manager.account()['id'], stage='正在重试空间回收', usernames=[])
+    try:
+        return archive.reclaim_space()
+    finally:
+        with manager.lock:
+            manager.cleanup = None
+
+
+class SelectionReq(BaseModel):
+    account_id: str
+    filters: dict = Field(default_factory=dict)
+    category: str = ''
+    archive_state: str = ''
+    min_count: int | None = Field(default=None, ge=0)
+    max_count: int | None = Field(default=None, ge=0)
+    last_start: int | None = None
+    last_end: int | None = None
+    include_unknown: bool = False
+
+
+@app.post('/api/selection-preview')
+def selection_preview(req: SelectionReq):
+    with manager.lock:
+        manager.require_account(req.account_id)
+        validate_range(req.min_count, req.max_count)
+        validate_range(req.last_start, req.last_end)
+        allowed = {'q', 'category', 'start', 'end', 'sort', 'date_mode', 'include_unknown', 'group_id'}
+        rows = contacts(**{k: v for k, v in req.filters.items() if k in allowed})
+        result = []
+        for row in rows:
+            if req.category and row['category'] not in req.category.split(','):
+                continue
+            if req.archive_state and row['imported'] != (req.archive_state == 'imported'):
+                continue
+            numeric = req.min_count is not None or req.max_count is not None
+            dated = req.last_start is not None or req.last_end is not None
+            if not row['imported']:
+                if (numeric or dated) and not req.include_unknown:
+                    continue
+            elif ((req.min_count is not None and row['total'] < req.min_count) or
+                  (req.max_count is not None and row['total'] > req.max_count)):
+                continue
+            if row['imported'] and dated:
+                last = row.get('last_timestamp')
+                if last is None:
+                    if not req.include_unknown:
+                        continue
+                elif ((req.last_start is not None and last < req.last_start) or
+                      (req.last_end is not None and last > req.last_end)):
+                    continue
+            result.append(row)
+        return dict(account_id=req.account_id, members=result, usernames=[r['username'] for r in result])
 
 
 @app.get('/api/contacts')
@@ -505,7 +601,9 @@ def export_search(req: SearchExportReq):
         raise ValueError('命中导出请选择一个会话')
     if req.format not in ('txt', 'json', 'zip'):
         raise ValueError('格式必须为 txt、json 或 zip')
-    archive = manager.archive()
+    with manager.lock:
+        manager.require_account(req.account_id)
+        archive = manager.archive()
     archive.require_visible(req.usernames)
     with closing(archive.connect()) as connection:
         connection.execute('BEGIN')
@@ -534,7 +632,9 @@ def export_search(req: SearchExportReq):
 
 @app.post('/api/export')
 def export(req: ExportReq):
-    archive = manager.archive()
+    with manager.lock:
+        manager.require_account(req.account_id)
+        archive = manager.archive()
     with closing(archive.connect()) as connection:
         connection.execute('BEGIN')
         return export_snapshot(req, archive, connection)

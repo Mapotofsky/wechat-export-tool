@@ -173,7 +173,7 @@ class VoiceManagementTests(unittest.TestCase):
             with patch.object(voice_service, 'probe', return_value={'available': True, 'models': []}) as probe, patch.object(
                     voice_service, 'find_media', return_value=(b'media', {})), patch.object(
                     voice_service, 'recognize_online', return_value={'text': '在线更新', 'provider': 'dashscope'}) as online:
-                web.task(web.TaskReq(action='transcribe', usernames=[self.username], voice_targets=self.targets))
+                web.task(web.TaskReq(account_id=self.manager.account()['id'], action='transcribe', usernames=[self.username], voice_targets=self.targets))
                 self.manager.executor.shutdown()
             self.assertEqual(self.manager.status()['task']['status'], 'success')
             probe.assert_called_once_with(online=True)

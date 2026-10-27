@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 import zipfile
@@ -31,6 +32,7 @@ class SearchTests(unittest.TestCase):
         self.archive.save_transcript('group', 'server:3', b'a', 'success', '语音报销内容')
         self.archive.save_transcript('group', 'server:5', b'b', 'failed', '报销失败内容')
         self.manager = Mock()
+        self.manager.lock = threading.RLock()
         self.manager.archive.return_value = self.archive
         self.patcher = patch.object(web, 'manager', self.manager)
         self.patcher.start()
@@ -97,7 +99,7 @@ class SearchTests(unittest.TestCase):
         async def collect(response):
             return b''.join([part async for part in response.body_iterator])
         for fmt in ('json', 'txt', 'zip'):
-            req = web.SearchExportReq(usernames=['group'], format=fmt, q='报销', day=self.day.isoformat())
+            req = web.SearchExportReq(account_id='synthetic', usernames=['group'], format=fmt, q='报销', day=self.day.isoformat())
             body = asyncio.run(collect(web.export_search(req)))
             if fmt == 'txt':
                 self.assertIn('"count": 3', body.decode())
@@ -119,7 +121,7 @@ class SearchTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 web.messages('group', **values)
         with self.assertRaises(ValueError):
-            web.export_search(web.SearchExportReq(usernames=['a', 'b']))
+            web.export_search(web.SearchExportReq(account_id='synthetic', usernames=['a', 'b']))
 
     def test_http_query_context_and_download_contract(self):
         with TestClient(web.app) as client:
@@ -130,7 +132,7 @@ class SearchTests(unittest.TestCase):
             self.assertEqual(response.json()['limit'], 50)
             self.assertEqual(client.get('/api/context', params={'username': 'group',
                 'message_id': 'server:3'}).json()['target_id'], 'server:3')
-            response = client.post('/api/export-search', json={'usernames': ['group'], 'format': 'json',
+            response = client.post('/api/export-search', json={'account_id':'synthetic', 'usernames': ['group'], 'format': 'json',
                                                               'q': '报销', 'day': self.day.isoformat()})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()['total'], 2)

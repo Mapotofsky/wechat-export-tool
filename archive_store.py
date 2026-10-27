@@ -72,12 +72,16 @@ class Archive:
                 return self.contacts(c)
         return [json.loads(r[0]) for r in connection.execute('SELECT data FROM chats')]
 
-    def directory_contacts(self, include_hidden=False):
-        config = self.config()
+    def directory_contacts(self, include_hidden=False, connection=None):
+        if connection is None:
+            with closing(self.connect()) as c:
+                c.execute('BEGIN')
+                return self.directory_contacts(include_hidden, c)
+        config = {k: json.loads(v) for k, v in connection.execute('SELECT key,value FROM settings')}
         rows = {r['username']: dict(r, total=0, first_timestamp=None, last_timestamp=None,
                 preview='', recorded_senders=[], recorded_sender_count=0, imported=False)
                 for r in config.get('contact_directory', [])}
-        for r in self.contacts():
+        for r in self.contacts(connection):
             rows[r['username']] = dict(rows.get(r['username'], {}), **r, imported=True)
         followed = set(config.get('followed_usernames', []))
         hidden = set(config.get('hidden_usernames', []))
@@ -87,6 +91,32 @@ class Archive:
     def require_visible(self, usernames):
         if set(usernames) & set(self.config().get('hidden_usernames', [])):
             raise ValueError('范围包含隐藏会话；请先在隐藏会话管理中恢复')
+
+    def maintenance_contacts(self):
+        """All-update also includes historical sessions in the prepared source catalog."""
+        rows = {r['username']: r for r in self.directory_contacts()}
+        config = self.config()
+        hidden = set(config.get('hidden_usernames', []))
+        source = config.get('message_snapshot') or config.get('decrypted_dir')
+        if source:
+            for u in self.source_sessions(source):
+                if u not in hidden:
+                    rows.setdefault(u, dict(username=u, name=u, category=we.classify_username(u),
+                                            imported=False, total=0, first_timestamp=None, last_timestamp=None))
+        return list(rows.values())
+
+    @staticmethod
+    def source_sessions(db_dir):
+        users = set()
+        for path in sorted((Path(db_dir) / 'message').glob('message_*.db')):
+            if not we.is_message_shard(path.name):
+                continue
+            with closing(we._connect_ro(str(path))) as c:
+                tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if 'Name2Id' in tables:
+                    users.update(u for (u,) in c.execute('SELECT user_name FROM Name2Id')
+                                 if u and 'Msg_' + hashlib.md5(u.encode()).hexdigest() in tables)
+        return sorted(users)
 
     def groups(self):
         config = self.config()
@@ -103,7 +133,31 @@ class Archive:
                 'imported': [r for r in members if r['imported']],
                 'pending': [r for r in members if not r['imported']]}
 
-    def set_hidden(self, usernames, hidden=True, purge=False):
+    def hidden_preview(self, usernames, purge=False):
+        with closing(self.connect()) as c:
+            c.execute('BEGIN')
+            known = {r['username']: r for r in self.directory_contacts(True, c)}
+            users = list(dict.fromkeys(usernames))
+            if not users or set(users) - known.keys():
+                raise ValueError('请选择有效会话')
+            counts = {'messages': 0, 'transcripts': 0, 'successful_transcripts': 0}
+            for u in users:
+                counts['messages'] += c.execute('SELECT count(*) FROM messages WHERE username=?', (u,)).fetchone()[0]
+                total, success = c.execute("SELECT count(*),coalesce(sum(status='success'),0) FROM transcripts WHERE username=?", (u,)).fetchone()
+                counts['transcripts'] += total
+                counts['successful_transcripts'] += success
+            return dict(usernames=users, members=[known[u] for u in users], purge=purge, counts=counts)
+
+    def reclaim_space(self):
+        with closing(self.connect()) as c:
+            try:
+                c.execute('VACUUM')
+                reclaimed = c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0
+                return dict(space_reclaimed=reclaimed, warning='' if reclaimed else '档案已清理，空间回收未完成；请稍后重试空间回收。')
+            except sqlite3.Error as exc:
+                return dict(space_reclaimed=False, warning=f'档案已清理，空间回收未完成：{exc}；可稍后重试空间回收。')
+
+    def set_hidden(self, usernames, hidden=True, purge=False, progress=None):
         config = self.config()
         known = {r['username']: r for r in self.directory_contacts(include_hidden=True)}
         if not usernames or set(usernames) - known.keys():
@@ -120,10 +174,14 @@ class Archive:
         if config.get('view_state', {}).get('active') in blocked:
             values['view_state'] = {}
         deleted = 0
+        if progress:
+            progress('正在提交档案清理' if purge else '正在保存隐藏状态')
         with closing(self.connect()) as c:
             with c:
                 if hidden and purge:
-                    for u in usernames:
+                    for index, u in enumerate(usernames):
+                        if progress:
+                            progress(f'正在清理会话 {index + 1} / {len(usernames)}（事务尚未提交）')
                         for table in ('messages', 'transcripts', 'locations', 'current_sources', 'chats'):
                             count = c.execute(f'DELETE FROM {table} WHERE username=?', (u,)).rowcount
                             if table == 'messages':
@@ -132,32 +190,19 @@ class Archive:
                                                         if u not in usernames}
                 c.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)',
                               [(k, json.dumps(v, ensure_ascii=False)) for k, v in values.items()])
-            if hidden and purge:
-                try:
-                    c.execute('VACUUM')
-                    checkpoint = c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
-                    reclaimed = checkpoint[0] == 0
-                except sqlite3.Error as exc:
-                    return {'saved': True, 'deleted_messages': deleted, 'space_reclaimed': False,
-                            'warning': f'档案已清理，但数据库空间回收未完成：{exc}；可稍后在隐藏会话管理中重试清理。'}
-            else:
-                reclaimed = False
-        return {'saved': True, 'deleted_messages': deleted, 'space_reclaimed': reclaimed}
+        result = {'saved': True, 'deleted_messages': deleted, 'space_reclaimed': False}
+        if hidden and purge:
+            if progress:
+                progress('档案已清理，正在回收空间')
+            result.update(self.reclaim_space())
+        return result
 
     def prepare_directory(self, db_dir, discover=False):
         rows = {r['username']: r for r in self.config().get('contact_directory', [])}
         rows.update({r['username']: r for r in we.load_contacts(str(db_dir), include_official=True, only_with_msg=False)})
         if discover:
-            for path in sorted((Path(db_dir) / 'message').glob('message_*.db')):
-                if not we.is_message_shard(path.name):
-                    continue
-                with closing(we._connect_ro(str(path))) as c:
-                    tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                    if 'Name2Id' not in tables:
-                        continue
-                    for (u,) in c.execute('SELECT user_name FROM Name2Id'):
-                        if u and 'Msg_' + hashlib.md5(u.encode()).hexdigest() in tables and u not in rows:
-                            rows[u] = {'username': u, 'name': u, 'category': we.classify_username(u)}
+            for u in self.source_sessions(db_dir):
+                rows.setdefault(u, {'username': u, 'name': u, 'category': we.classify_username(u)})
         self.save_config({'contact_directory': list(rows.values()), 'decrypted_dir': str(db_dir)})
         return len(rows)
 

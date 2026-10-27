@@ -137,7 +137,35 @@ class Manager:
             return self.archives[account['id']]
 
     def busy(self):
-        return self.task is not None and self.task['status'] == 'running'
+        return bool(getattr(self, 'cleanup', None)) or (self.task is not None and self.task['status'] == 'running')
+
+    def require_account(self, account_id):
+        if account_id is not None and (not self.account() or self.account()['id'] != account_id):
+            raise ValueError('账号已切换，请刷新并重新核对范围')
+
+    def operation_preview(self, action, usernames=None, group_id=None, account_id=None):
+        with self.lock:
+            self.require_account(account_id)
+            archive = self.archive()
+            rows = archive.maintenance_contacts() if action == 'update_all' else archive.directory_contacts()
+            available = {r['username']: r for r in rows}
+            if group_id is not None:
+                requested = next((g['usernames'] for g in archive.groups() if g['id'] == group_id), None)
+                if requested is None:
+                    raise ValueError('项目不存在，请重新选择')
+                rows = archive.group_scope(group_id)['members']
+                available = {r['username']: r for r in rows}
+            elif action == 'update_all' and usernames is None:
+                requested = list(available) + archive.config().get('hidden_usernames', [])
+            else:
+                requested = archive.config().get('followed_usernames', []) if usernames is None else usernames
+            requested = list(dict.fromkeys(requested))
+            members = [available[u] for u in requested if u in available]
+            pending = [r for r in members if not r['imported']]
+            actual = [r for r in members if r['imported']] if action in ('analysis', 'export', 'transcribe') else members
+            return dict(account_id=self.account()['id'], account_label=self.account()['label'], action=action,
+                        usernames=[r['username'] for r in actual], members=members, pending=pending,
+                        excluded=[u for u in requested if u not in available])
 
     def select(self, directory, label, confirmed):
         if not confirmed or not label.strip():
@@ -180,7 +208,7 @@ class Manager:
                 path = archive.directory / 'task.json'
                 if path.exists():
                     task = json.loads(path.read_text(encoding='utf-8'))
-        return {'account': account, 'accounts': self.registry['accounts'], 'config': config, 'setup': setup or self.setup(config={}),
+        return {'account': account, 'accounts': self.registry['accounts'], 'config': config, 'cleanup': getattr(self, 'cleanup', None), 'setup': setup or self.setup(config={}),
                 'task': task, 'wal_validation': '尚未执行真实微信加密 WAL 端到端验证'}
 
     def setup(self, account=None, config=None):
@@ -205,8 +233,10 @@ class Manager:
                     next_action=action, blocked_reason=('源目录不可用，请重新选择目录；已有档案仍可阅读' if account and not source else
                     config.get('keys_error') or ('请先提取密钥或保存已有密钥路径' if needs_keys and not has_keys else '')))
 
-    def submit(self, action, usernames=None, group_id=None, voice_targets=None):
+    def submit(self, action, usernames=None, group_id=None, voice_targets=None, account_id=None):
         with self.lock:
+            self.require_account(account_id)
+            explicit = usernames is not None and group_id is None
             if self.busy():
                 raise ValueError('已有维护任务正在执行，可继续查看列表和导出')
             account = dict(self.account() or {})
@@ -227,13 +257,19 @@ class Manager:
                 usernames = [r['username'] for r in archive.group_scope(group_id)['members']]
             if action == 'update' and usernames is None:
                 usernames = archive.config().get('followed_usernames', [])
+            if action == 'update_all' and usernames is None:
+                usernames = [r['username'] for r in archive.maintenance_contacts()]
             usernames = list(dict.fromkeys(usernames or []))
-            if action in ('update', 'transcribe'):
+            if explicit and account_id is not None:
+                archive.require_visible(usernames)
+            if action in ('update', 'update_all', 'transcribe'):
                 # Hidden followed members keep their membership but never enter maintenance.
                 blocked = set(archive.config().get('hidden_usernames', []))
                 usernames = [u for u in usernames if u not in blocked]
-            if action in ('update', 'transcribe') and not usernames:
+            if action in ('update', 'update_all', 'transcribe') and not usernames:
                 raise ValueError('处理范围为空；请先保存关注会话或明确选择会话')
+            if action in ('update', 'update_all', 'transcribe') and set(usernames) - {r['username'] for r in (archive.maintenance_contacts() if action == 'update_all' else archive.directory_contacts())}:
+                raise ValueError('范围包含未知会话，请刷新并重新选择')
             if action == 'transcribe' and set(usernames) - {r['username'] for r in archive.contacts()}:
                 raise ValueError('所选会话尚未导入；请先导入所选会话')
             if voice_targets is not None:
@@ -319,7 +355,7 @@ class Manager:
                     with closing(archive.connect()) as c:
                         media_needed = action in ('update', 'update_all') and bool(c.execute(
                             "SELECT 1 FROM transcripts WHERE status='success' AND (? OR username IN (SELECT value FROM json_each(?))) LIMIT 1",
-                            (action == 'update_all', json.dumps(usernames))).fetchone())
+                            (False, json.dumps(usernames))).fetchone())
                     db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
                                                           config['keys_file'], [db_dir, config.get('message_snapshot'), config.get('media_snapshot')], progress,
                                                           contacts_only=action == 'prepare', media=media_needed)
@@ -344,7 +380,7 @@ class Manager:
                             published['media_snapshot'] = str(db_dir)
                     result = archive.update(db_dir, progress, settings=published,
                                             signatures=manifest if account['mode'] == 'encrypted' else None,
-                                            usernames=None if action == 'update_all' else usernames)
+                                            usernames=usernames)
                     result['decrypted_reused'] = sum(x['reused'] for x in manifest.values())
             elif action == 'transcribe':
                 if not usernames:

@@ -56,7 +56,7 @@ class UsabilityTests(unittest.TestCase):
         self.assertEqual(web.message_count(username, start, end)['total'], len(messages))
         async def body(response):
             return b''.join([p async for p in response.body_iterator])
-        result = json.loads(asyncio.run(body(web.export(web.ExportReq(usernames=[username], format='json', start=start, end=end)))))
+        result = json.loads(asyncio.run(body(web.export(web.ExportReq(account_id=self.manager.account()['id'], usernames=[username], format='json', start=start, end=end)))))
         self.assertEqual(result['total'], len(messages))
         self.assertEqual(result['contact']['total'], len(messages))
         self.assertEqual([m['timestamp'] for m in result['messages']], [m['timestamp'] for m in messages])

@@ -318,7 +318,7 @@ class MaintenanceTests(unittest.TestCase):
             with patch.object(we, 'get_messages', side_effect=AssertionError('list must not scan source')):
                 self.assertEqual(web.contacts(sort='count')[0]['total'], 2)
             for fmt in ('txt', 'json', 'zip'):
-                data = asyncio.run(body(web.export(web.ExportReq(usernames=[self.username], format=fmt))))
+                data = asyncio.run(body(web.export(web.ExportReq(account_id=manager.account()['id'], usernames=[self.username], format=fmt))))
                 if fmt == 'zip':
                     with zipfile.ZipFile(io.BytesIO(data)) as z:
                         record = json.loads(z.read(next(n for n in z.namelist() if n.endswith('.json'))))
