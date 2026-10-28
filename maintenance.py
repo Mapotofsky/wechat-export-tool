@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 import subprocess
+import shutil
 import threading
 import time
 import traceback
@@ -13,7 +14,9 @@ import uuid
 from archive_store import Archive, now
 import encrypted_sync
 import voice_service
+import supervised_process
 import wechat_export as we
+from task_lifecycle import Cancellation, TaskCancelled, CleanupError
 from runtime_paths import python_executable, resource_root
 
 
@@ -115,14 +118,18 @@ class Manager:
         self.archives = {}
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='wechat-maintenance')
         self.task = None
+        self.cancellation = None
         for account in self.registry['accounts']:
             task_file = self.root / account['id'] / 'task.json'
             if task_file.exists():
                 task = json.loads(task_file.read_text(encoding='utf-8'))
-                if task['status'] == 'running':
+                if task['status'] in ('running', 'cancelling'):
                     task.update(status='interrupted', stage='上次任务已中断', reason='服务已重启；之前可用数据仍保留',
                                 next_step='重新执行对应操作', finished=now())
                     atomic_json(task_file, task)
+                if task.get('cleanup_resources') and account['id'] == self.registry.get('active'):
+                    self.cleanup = {'stage': '任务资源清理未完成，请重试', 'type': 'task_resources',
+                                    'task_id': task.get('id'), 'account_id': account['id']}
 
     def account(self):
         return next((a for a in self.registry['accounts'] if a['id'] == self.registry['active']), None)
@@ -137,7 +144,50 @@ class Manager:
             return self.archives[account['id']]
 
     def busy(self):
-        return bool(getattr(self, 'cleanup', None)) or (self.task is not None and self.task['status'] == 'running')
+        return bool(getattr(self, 'cleanup', None)) or (self.task is not None and self.task['status'] in ('running', 'cancelling'))
+
+    def cancel(self, task_id, account_id):
+        with self.lock:
+            self.require_account(account_id)
+            task = self.task
+            if not task or task['id'] != task_id or task['account_id'] != account_id:
+                if self.account():
+                    path = self.archive().directory / 'task.json'
+                    if path.exists():
+                        saved = json.loads(path.read_text(encoding='utf-8'))
+                        if saved.get('id') == task_id and saved.get('account_id') == account_id and saved.get('status') not in ('running', 'cancelling'):
+                            return saved
+                raise ValueError('任务不存在或不属于当前账号')
+            if task['status'] == 'running' and task.get('cancellable', True):
+                self.cancellation.event.set()
+                task.update(status='cancelling', cancel_boundary='等待当前安全边界及资源清理')
+                atomic_json(self.archive().directory / 'task.json', task)
+            return dict(task)
+
+    def retry_task_cleanup(self, task_id, account_id):
+        with self.lock:
+            self.require_account(account_id)
+            if not getattr(self, 'cleanup', None) or self.cleanup.get('type') != 'task_resources' or self.cleanup.get('task_id') != task_id:
+                raise ValueError('没有需要重试的任务资源清理')
+            path = self.archive().directory / 'task.json'
+            task = self.task if self.task and self.task.get('id') == task_id else json.loads(path.read_text(encoding='utf-8'))
+            self.cleanup['stage'] = '正在重试任务资源清理'
+            try:
+                for resource in task['cleanup_resources']:
+                    target = Path(resource['path'])
+                    if resource['directory']:
+                        if target.exists():
+                            shutil.rmtree(target)
+                    else:
+                        target.unlink(missing_ok=True)
+            except OSError as exc:
+                self.cleanup['stage'] = f'任务资源清理未完成：{exc}；请重试'
+                raise
+            task.pop('cleanup_resources', None)
+            task.update(next_step='资源清理完成，可按原范围重新执行任务')
+            atomic_json(path, task)
+            self.cleanup = None
+            return dict(task)
 
     def require_account(self, account_id):
         if account_id is not None and (not self.account() or self.account()['id'] != account_id):
@@ -279,24 +329,43 @@ class Manager:
             task = {'id': uuid.uuid4().hex, 'account_id': account['id'], 'action': action,
                     'status': 'running', 'stage': '准备', 'done': 0, 'total': 0, 'started': now(),
                     'next_step': '', 'reason': '', 'selected_usernames': usernames, 'selected_count': len(usernames),
-                    'scope': 'all' if action == 'update_all' else 'selected'}
+                    'scope': 'all' if action == 'update_all' else 'selected', 'cancellable': True,
+                    'cancel_boundary': '等待当前安全边界', 'publication': '未发布'}
             if voice_targets is not None:
                 task['voice_targets'] = voice_targets
             self.task = task
+            self.cancellation = Cancellation(self.lock)
             atomic_json(archive.directory / 'task.json', task)
             self.executor.submit(self.perform, account, archive, task, action, usernames)
             return dict(task)
 
     def perform(self, account, archive, task, action, usernames):
         task_path = archive.directory / 'task.json'
+        cancellation = self.cancellation or Cancellation()
+        generation = None
+        keys = None
+        outcome = 'failed'
+        final_stage = None
         last_publication = 0.
         def progress(stage, done=0, total=0):
             nonlocal last_publication
             with self.lock:
+                if stage in ('提交消息档案', '提交通讯录', '提交密钥'):
+                    cancellation.check()
+                    task.update(cancellable=False, cancel_boundary='正在提交，等待实际结果')
+                elif task.get('cancellable', True):
+                    cancellation.check()
+                if stage == '完成':
+                    if not task.get('cancellable', True):
+                        task['publication'] = '已提交'
+                    stage = '正在完成当前阶段'
+                unit = ('字节' if stage == '复制快照' else '页' if '页面' in stage else
+                        '条语音' if '语音转写' in stage else '个会话' if '导入消息' in stage or '会话元数据' in stage else
+                        '个数据库' if '稳定快照' in stage or '解密与 WAL' in stage else '')
                 if action in ('update', 'update_all', 'transcribe'):
                     stage += (f" · 已选 {len(task['voice_targets'])} 条语音" if 'voice_targets' in task else
                               ' · 全部会话' if action == 'update_all' else f' · 已选 {len(usernames)} 个会话')
-                task.update(stage=stage, done=done, total=total)
+                task.update(stage=stage, done=done, total=total, unit=unit)
                 if time.monotonic() - last_publication >= .5:
                     atomic_json(task_path, task)
                     last_publication = time.monotonic()
@@ -311,10 +380,9 @@ class Manager:
                 keys = archive.directory / ('keys_' + uuid.uuid4().hex + '.json')
                 diagnostic_path = keys.with_suffix('.diagnostic.json')
                 try:
-                    process = subprocess.run([str(python_executable()), str(resource_root() / 'wcdb_key_tool_windows.py'),
+                    process = supervised_process.run([str(python_executable()), str(resource_root() / 'wcdb_key_tool_windows.py'),
                                              'extract', '--db-dir', account['directory'], '--diagnostics-output', str(diagnostic_path), '--output', str(keys)],
-                                            capture_output=True, timeout=600,
-                                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                                            cancellation=cancellation, timeout=600)
                     diagnostic = {}
                     if diagnostic_path.exists():
                         try:
@@ -344,6 +412,9 @@ class Manager:
                     raise RuntimeError('TimeoutExpired：密钥提取超时（600 秒）') from None
                 finally:
                     diagnostic_path.unlink(missing_ok=True)
+                    if cancellation.event.is_set():
+                        keys.unlink(missing_ok=True)
+                progress('提交密钥')
                 archive.save_config({'keys_file': str(keys), 'keys_error': ''})
                 result = {'keys_saved': True, 'coverage': code, 'next_step': feedback}
             elif action in ('prepare', 'discover', 'update', 'update_all'):
@@ -359,14 +430,16 @@ class Manager:
                     db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
                                                           config['keys_file'], [db_dir, config.get('message_snapshot'), config.get('media_snapshot')], progress,
                                                           contacts_only=action == 'prepare', media=media_needed)
-                    archive.save_config({'keys_error': ''})
+                    generation = db_dir
                 if action in ('prepare', 'discover'):
-                    archive.save_config({'decrypted_dir': str(db_dir)})
+                    published = {}
                     if account['mode'] == 'encrypted':
+                        published['keys_error'] = ''
                         snapshot = db_dir if action == 'discover' else config.get('message_snapshot') or config.get('decrypted_dir')
                         if snapshot:
-                            archive.save_config({'message_snapshot': str(snapshot)})
-                    count = archive.prepare_directory(db_dir, discover=action == 'discover')
+                            published['message_snapshot'] = str(snapshot)
+                    count = archive.prepare_directory(db_dir, discover=action == 'discover', settings=published,
+                                                      before_publish=lambda: progress('提交通讯录'), progress=progress)
                     result = {'prepared': True, 'databases': len(manifest),
                               'contacts': count, 'next_step': ('通讯录已准备，可选择会话并导入，或继续阅读已归档消息' if config.get('self_username') else
                               '查找并保存本人身份，再选择会话并导入；关注范围可选')}
@@ -375,6 +448,7 @@ class Manager:
                         raise ValueError('请先查找并确认自己的内部 username')
                     published = {'decrypted_dir': str(db_dir)}
                     if account['mode'] == 'encrypted':
+                        published['keys_error'] = ''
                         published['message_snapshot'] = str(db_dir)
                         if media_needed:
                             published['media_snapshot'] = str(db_dir)
@@ -388,13 +462,16 @@ class Manager:
                 if account['mode'] == 'encrypted':
                     db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
                         config['keys_file'], [config.get('decrypted_dir'), config.get('media_snapshot')], progress, contacts_only=True, media=True)
-                    archive.save_config({'decrypted_dir': str(db_dir), 'media_snapshot': str(db_dir),
-                                         'message_snapshot': config.get('message_snapshot') or config.get('decrypted_dir')})
+                    generation = db_dir
+                    cancellation.publish(lambda: archive.save_config({'decrypted_dir': str(db_dir), 'media_snapshot': str(db_dir),
+                                         'message_snapshot': config.get('message_snapshot') or config.get('decrypted_dir')}))
+                    with self.lock:
+                        task['publication'] = '快照已发布；语音逐条发布'
                     config['decrypted_dir'] = str(db_dir)
                 online = config.get('asr_provider', 'local') != 'local'
                 voice_service.validate_api(config)
                 progress('检查在线识别与音频工具' if online else '检查本地识别工具')
-                info = voice_service.probe(online=True) if online else voice_service.probe()
+                info = voice_service.probe(online=True, cancellation=cancellation) if online else voice_service.probe(cancellation=cancellation)
                 if not online and config.get('asr_model') and Path(config['asr_model']).is_file():
                     info['available'] = bool(info.get('whisper') and info.get('ffmpeg'))
                 if not info['available']:
@@ -407,11 +484,15 @@ class Manager:
                     if media.startswith((b'\x02#!SILK_V3', b'#!SILK_V3')) and not info.get('silk'):
                         raise voice_service.ToolUnavailable('缺少 SILK 解码工具 pilk')
                     if online:
-                        return voice_service.recognize_online(media, config)
-                    result = voice_service.recognize(media, chosen_model, details=True)
+                        return voice_service.recognize_online(media, config, cancellation=cancellation, progress=progress)
+                    result = voice_service.recognize(media, chosen_model, details=True, cancellation=cancellation)
                     return dict(result, provider='local', model=chosen_model)
+                def voice_published(counts):
+                    with self.lock:
+                        task.update(publication='逐条发布', result=dict(counts))
                 result = voice_service.transcribe(archive, config['decrypted_dir'], usernames, model, progress, recognizer,
-                                                 targets=task.get('voice_targets'), force='voice_targets' in task)
+                                                 targets=task.get('voice_targets'), force='voice_targets' in task, cancellation=cancellation,
+                                                 on_publish=voice_published)
             else:
                 raise ValueError('未知任务')
             if manifest:
@@ -421,29 +502,67 @@ class Manager:
                     'snapshot_bytes': sum(x.get('snapshot_bytes', 0) for x in manifest.values()),
                     'materialized_bytes': sum(x.get('source_bytes', 0) for x in manifest.values() if not x['reused'])}
             with self.lock:
+                task['publication'] = '已提交' if action != 'transcribe' else '逐条发布'
                 if action == 'transcribe' and result['failed']:
-                    task.update(status='failed', stage='转写结束，存在失败语音', result=result,
-                                reason=f"{result['failed']} 条语音转写失败，具体原因见下方汇总", finished=now(),
+                    outcome = 'failed'
+                    final_stage = '转写结束，存在失败语音'
+                    task.update(stage='正在清理任务资源', result=result,
+                                reason=f"{result['failed']} 条语音转写失败，具体原因见下方汇总",
                                 next_step='按错误汇总修复工具后重试；成功的转写会自动复用')
                 else:
-                    task.update(status='success', stage='部分密钥已保存' if task.get('diagnostic_code') == 'partial' else '完成', result=result, finished=now(), next_step=result.get('next_step', '可查看列表或导出'))
+                    outcome = 'success'
+                    final_stage = '部分密钥已保存' if task.get('diagnostic_code') == 'partial' else '完成'
+                    task.update(stage='正在清理任务资源', result=result, next_step=result.get('next_step', '可查看列表或导出'))
+        except TaskCancelled as exc:
+            with self.lock:
+                outcome = 'cancelled'
+                task.update(stage='正在清理任务资源', cancellable=False,
+                            next_step='可按原范围重新执行；已发布结果保留')
+                if hasattr(exc, 'result'):
+                    task.update(result=exc.result, publication='逐条发布')
         except BaseException as exc:
             logging.getLogger(__name__).exception('维护任务 %s 在 %s 失败', action, task['stage'])
             with self.lock:
+                if isinstance(exc, CleanupError):
+                    task['cleanup_resources'] = [exc.resource]
                 if isinstance(exc, encrypted_sync.KeyPreparationError):
                     archive.save_config({'keys_error': str(exc)})
                     task.update(diagnostic_code='keys_invalid', next_step='返回数据设置，重新提取或选择密钥文件，再准备通讯录；旧档案仍可阅读')
                 # Avoid printing raw SQL values or subprocess output.
-                if isinstance(exc, OSError):
+                if isinstance(exc, CleanupError):
+                    reason = f'任务资源清理失败：{exc}；请重试任务资源清理'
+                elif isinstance(exc, OSError):
                     filename = Path(exc.filename2 or exc.filename).name if (exc.filename2 or exc.filename) else '未知文件'
                     code = getattr(exc, 'winerror', None) or exc.errno
                     reason = f'{type(exc).__name__}：文件 {filename} 操作失败（系统错误 {code}：{exc.strerror}）'
                 else:
                     reason = f'{type(exc).__name__}：{exc}'
                 frame = traceback.extract_tb(exc.__traceback__)[-1]
-                task.update(status='failed', failed_stage=task['stage'], reason=reason, finished=now(),
+                task.update(failed_stage=task['stage'], reason=reason,
                             error_location=f'{Path(frame.filename).name}:{frame.lineno} · {frame.name}',
                             next_step=task.get('next_step') or '按失败原因调整目录、身份或工具后重新执行；此前可用档案仍保留')
         finally:
+            try:
+                config = archive.config()
+                if generation and str(generation) not in {config.get('decrypted_dir'), config.get('message_snapshot'), config.get('media_snapshot')}:
+                    shutil.rmtree(generation)
+                if keys and str(keys) != config.get('keys_file'):
+                    keys.unlink(missing_ok=True)
+            except OSError as exc:
+                outcome = 'failed'
+                task.update(reason=f'任务资源清理失败：{exc}', next_step='检查数据目录访问权限后重试；已发布结果保留')
+                if generation and Path(generation).exists():
+                    task.setdefault('cleanup_resources', []).append({'path': str(generation), 'directory': True})
+                if keys and keys.exists() and str(keys) != config.get('keys_file'):
+                    task.setdefault('cleanup_resources', []).append({'path': str(keys), 'directory': False})
             with self.lock:
+                task.update(status=outcome, finished=now(), cancellable=False)
+                task['cancel_boundary'] = ''
+                if outcome == 'cancelled':
+                    task['stage'] = '已停止'
+                elif final_stage:
+                    task['stage'] = final_stage
+                if task.get('cleanup_resources'):
+                    self.cleanup = {'stage': '任务资源清理未完成，请重试', 'type': 'task_resources',
+                                    'task_id': task.get('id'), 'account_id': task.get('account_id')}
                 atomic_json(task_path, task)

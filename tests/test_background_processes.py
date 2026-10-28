@@ -71,8 +71,8 @@ class BackgroundProcessTests(unittest.TestCase):
                         self.assertEqual(command[:3], [str(Path('C:/base runtime/python.exe')),
                             str(maintenance.resource_root() / 'wcdb_key_tool_windows.py'), 'extract'])
                         self.assertEqual(command[4], account['directory'])
-                        self.assertEqual(options, dict(capture_output=True, timeout=600,
-                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)))
+                        self.assertEqual(options['timeout'], 600)
+                        self.assertIsNotNone(options['cancellation'])
                         if outcome == 'timeout':
                             raise subprocess.TimeoutExpired(command, 600)
                         if outcome == 'success':
@@ -82,7 +82,7 @@ class BackgroundProcessTests(unittest.TestCase):
                                                            b'', b'synthetic private key output')
                     task = {'status': 'running'}
                     with patch.object(maintenance, 'python_executable', return_value=Path('C:/base runtime/python.exe')), patch.object(
-                            subprocess, 'run', side_effect=fake_run):
+                            maintenance.supervised_process, 'run', side_effect=fake_run):
                         manager.perform(account, archive, task, 'extract', [])
                     self.assertEqual(task['status'], 'success' if outcome == 'success' else 'failed')
                     if outcome != 'success':

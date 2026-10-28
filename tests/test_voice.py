@@ -176,7 +176,8 @@ class VoiceManagementTests(unittest.TestCase):
                 web.task(web.TaskReq(account_id=self.manager.account()['id'], action='transcribe', usernames=[self.username], voice_targets=self.targets))
                 self.manager.executor.shutdown()
             self.assertEqual(self.manager.status()['task']['status'], 'success')
-            probe.assert_called_once_with(online=True)
+            self.assertTrue(probe.call_args.kwargs['online'])
+            self.assertIs(probe.call_args.kwargs['cancellation'], self.manager.cancellation)
             online.assert_called_once()
             self.assertEqual(self.archive.transcript(self.username, 'server:103')[2], '在线更新')
 

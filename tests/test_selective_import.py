@@ -116,14 +116,30 @@ class SelectiveTests(unittest.TestCase):
         self.assertFalse(directory[self.a]['imported'])
         self.assertEqual(self.archive.contacts(), [])
 
+    def test_directory_and_snapshot_publish_together(self):
+        self.archive.prepare_directory(self.source, settings={'message_snapshot': 'old'})
+        before = self.archive.config()
+        with closing(self.archive.connect()) as c, c:
+            c.execute("CREATE TRIGGER reject_directory BEFORE INSERT ON settings "
+                      "WHEN NEW.key='contact_directory' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.archive.prepare_directory(self.source, discover=True, settings={'message_snapshot': 'new'})
+        self.assertEqual(self.archive.config(), before)
+        with closing(self.archive.connect()) as c, c:
+            c.execute('DROP TRIGGER reject_directory')
+        self.archive.prepare_directory(self.source, discover=True, settings={'message_snapshot': 'new'})
+        config = self.archive.config()
+        self.assertEqual(config['message_snapshot'], 'new')
+        self.assertIn(self.b, {row['username'] for row in config['contact_directory']})
+
     def test_plaintext_media_is_not_read_without_successful_transcripts(self):
         media = self.source / 'message' / 'media_9.db'
         media.write_bytes(b'synthetic deferred media')
         original = encrypted_sync.file_digest
         paths = []
-        def digest(path):
+        def digest(path, progress=lambda *args: None):
             paths.append(path.name)
-            return original(path)
+            return original(path, progress)
         with patch.object(encrypted_sync, 'file_digest', side_effect=digest):
             self.archive.update(self.source, usernames=[self.a])
         self.assertNotIn('media_9.db', paths)

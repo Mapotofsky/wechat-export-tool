@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -66,6 +68,60 @@ class DesktopTests(unittest.TestCase):
         self.assertFalse(bridge._can_close())
         bridge._saving = False
         self.assertTrue(bridge._can_close())
+
+    def test_close_requests_stop_then_waits_for_task_and_export(self):
+        busy = threading.Event()
+        busy.set()
+        stopped, closed = threading.Event(), threading.Event()
+        manager = SimpleNamespace(lock=threading.RLock(), task={'id':'task', 'account_id':'account'}, cleanup=None,
+                                  cancel=lambda *args: stopped.set())
+        bridge = desktop.NativeBridge('', busy.is_set, manager)
+        bridge._window = SimpleNamespace(create_confirmation_dialog=lambda *args: True, destroy=closed.set)
+        self.assertFalse(bridge._can_close())
+        self.assertTrue(stopped.is_set())
+        self.assertFalse(closed.is_set())
+        bridge._saving = True
+        busy.clear()
+        time.sleep(.2)
+        self.assertFalse(closed.is_set())
+        bridge._saving = False
+        self.assertTrue(closed.wait(2))
+
+    def test_close_wait_choice_does_not_cancel(self):
+        manager = SimpleNamespace(lock=threading.RLock(), task={'id':'task', 'account_id':'account'}, cleanup=None,
+                                  cancel=lambda *args: self.fail('unexpected cancellation'))
+        bridge = desktop.NativeBridge('', lambda: True, manager)
+        bridge._window = SimpleNamespace(create_confirmation_dialog=lambda *args: False)
+        self.assertFalse(bridge._can_close())
+
+    def test_running_export_save_blocks_close_until_bytes_written(self):
+        with tempfile.TemporaryDirectory(prefix='U3 合成导出 ') as tmp:
+            target = Path(tmp) / '导出 结果.json'
+            entered, release = threading.Event(), threading.Event()
+            class Response(io.BytesIO):
+                headers = {}
+                def read(self, *args):
+                    entered.set()
+                    self_test.assertTrue(release.wait(5))
+                    return super().read(*args)
+            self_test = self
+            bridge = desktop.NativeBridge('http://127.0.0.1:1234', lambda: False)
+            bridge._window = SimpleNamespace(create_file_dialog=lambda *args, **kwargs: (str(target),),
+                                              create_confirmation_dialog=lambda *args: True)
+            results = []
+            with patch.dict(sys.modules, {'webview': SimpleNamespace(FileDialog=SimpleNamespace(SAVE=1))}), patch.object(
+                    desktop.urllib.request, 'urlopen', return_value=Response(b'synthetic')):
+                thread = threading.Thread(target=lambda: results.append(bridge.save_export({'format':'json'})))
+                thread.start()
+                self.assertTrue(entered.wait(5))
+                self.assertFalse(bridge._can_close())
+                self.assertFalse(target.exists())
+                release.set()
+                thread.join(5)
+                self.assertFalse(thread.is_alive())
+            self.assertTrue(results[0]['saved'])
+            self.assertEqual(target.read_bytes(), b'synthetic')
+            self.assertTrue(bridge._can_close())
 
     @unittest.skipUnless(sys.platform == 'win32', 'Windows file locking')
     def test_second_instance_cannot_acquire_same_data_directory(self):

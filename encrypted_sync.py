@@ -18,6 +18,7 @@ import uuid
 import time
 
 import wcdb_key_tool_windows as cipher
+from task_lifecycle import CleanupError
 from wechat_export import is_message_shard
 
 
@@ -30,7 +31,7 @@ def checksum(data, endian, state=(0, 0)):
     return a, b
 
 
-def committed_frames(path):
+def committed_frames(path, progress=lambda *args: None):
     """Return authenticated WAL structure through the last valid commit only."""
     if not path.exists() or path.stat().st_size == 0:
         return [], None
@@ -47,6 +48,8 @@ def committed_frames(path):
         if state != struct.unpack('>II', header[24:]):
             raise ValueError('WAL 头校验失败')
         while True:
+            if len(frames) % 256 == 0:
+                progress('验证加密 WAL 提交边界', len(frames), 0)
             fh = f.read(24)
             if len(fh) != 24:
                 break
@@ -93,9 +96,11 @@ def materialize(source, target, key, progress=lambda *args: None):
             if pgno % 256 == 0:
                 progress('解密主数据库页面', pgno - 1, total_pages)
     progress('验证加密 WAL 提交边界', 0, 0)
-    frames, size = committed_frames(Path(str(source) + '-wal'))
+    frames, size = committed_frames(Path(str(source) + '-wal'), progress)
     with target.open('r+b') as out:
-        for pgno, page in frames:
+        for index, (pgno, page) in enumerate(frames):
+            if index % 256 == 0:
+                progress('解密 WAL 页面', index, len(frames))
             authenticate(page, pgno, mac_key)
             if pgno <= size:
                 out.seek((pgno - 1) * cipher.PAGE_SZ)
@@ -204,10 +209,11 @@ def stable_files(paths):
         release()
 
 
-def file_digest(path):
+def file_digest(path, progress=lambda *args: None):
     digest = hashlib.sha256()
     with path.open('rb') as f:
         while block := f.read(1024 * 1024):
+            progress('核对文件内容', 0, 0)
             digest.update(block)
     return digest.hexdigest()
 
@@ -217,6 +223,19 @@ class KeyPreparationError(ValueError):
 
 
 def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: None, contacts_only=False, media=False):
+    generation = Path(account_dir) / 'decrypted' / uuid.uuid4().hex
+    generation.mkdir(parents=True)
+    try:
+        return _sync(source, account_dir, keys_file, previous, progress, contacts_only, media, generation)
+    except BaseException:
+        try:
+            shutil.rmtree(generation)
+        except OSError as exc:
+            raise CleanupError(generation, True, exc) from exc
+        raise
+
+
+def _sync(source, account_dir, keys_file, previous, progress, contacts_only, media, generation):
     source, account_dir = Path(source), Path(account_dir)
     try:
         raw_keys = json.loads(Path(keys_file).read_text(encoding='utf-8'))
@@ -230,8 +249,6 @@ def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: N
                    (list((source / 'message').glob('media_*.db')) if media else []))
     if not files or not files[0].exists() or not list((source / 'message').glob('message_*.db')):
         raise ValueError('目录需要包含 contact/contact.db 与 message/message_*.db')
-    generation = account_dir / 'decrypted' / uuid.uuid4().hex
-    generation.mkdir(parents=True)
     manifest, reusable = {}, []
     previous_dirs = previous if isinstance(previous, (list, tuple)) else [previous]
     for directory in previous_dirs:
@@ -248,10 +265,10 @@ def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: N
             rel = db.relative_to(source)
             dst = snapshot / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(db, dst)
+            copy_chunks(db, dst, progress)
             wal = Path(str(db) + '-wal')
             if wal.exists():
-                shutil.copyfile(wal, Path(str(dst) + '-wal'))
+                copy_chunks(wal, Path(str(dst) + '-wal'), progress)
     snapshot_seconds = time.perf_counter() - snapshot_started
     for index, db in enumerate(files):
         file_started = time.perf_counter()
@@ -259,7 +276,7 @@ def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: N
         rel = db.relative_to(source)
         src, dst = snapshot / rel, generation / rel
         wal = Path(str(src) + '-wal')
-        signature = [file_digest(src), file_digest(wal) if wal.exists() else None]
+        signature = [file_digest(src, progress), file_digest(wal, progress) if wal.exists() else None]
         key_info = cipher._get_key_info(keys, str(rel))
         if not key_info:
             raise KeyPreparationError(f'缺少 {rel} 的密钥，请重新提取密钥或选择包含该库的密钥文件')
@@ -277,7 +294,7 @@ def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: N
                        if old.get(str(rel), {}).get('signature') == signature and (directory / rel).exists()), None)
         if cached:
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(cached[0] / rel, dst)
+            copy_chunks(cached[0] / rel, dst, progress)
             info = dict(cached[1], reused=True)
         else:
             info = dict(materialize(src, dst, key, progress), signature=signature, reused=False)
@@ -292,3 +309,14 @@ def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: N
             wal.unlink()
     (generation / 'sync.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     return generation, manifest
+
+
+def copy_chunks(source, target, progress):
+    total = source.stat().st_size
+    done = 0
+    with source.open('rb') as src, target.open('wb') as dst:
+        while block := src.read(1024 * 1024):
+            progress('复制快照', done, total)
+            dst.write(block)
+            done += len(block)
+    progress('复制快照', done, total)

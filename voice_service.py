@@ -12,6 +12,8 @@ from urllib.parse import urlsplit
 import uuid
 
 import wechat_export as we
+from task_lifecycle import TaskCancelled
+import supervised_process
 from runtime_paths import voice_python_executable, resource_root
 
 PYTHON = voice_python_executable()
@@ -22,9 +24,13 @@ class ToolUnavailable(RuntimeError):
     pass
 
 
-def run_worker(python, *args, timeout):
+def run_worker(python, *args, timeout, cancellation=None):
     # pythonw hosts and Windows consoles can use different default encodings.
-    return subprocess.run([str(python), str(WORKER), *args], capture_output=True,
+    command = [str(python), str(WORKER), *args]
+    if cancellation:
+        return supervised_process.run(command, cancellation=cancellation, timeout=timeout,
+            text=True, encoding='utf-8', errors='replace', env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
+    return subprocess.run(command, capture_output=True,
                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
                           text=True, encoding='utf-8', errors='replace', timeout=timeout,
                           env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
@@ -35,11 +41,11 @@ def process_failure(result):
     return f'退出码 {result.returncode}；{detail[-4000:] or "进程未返回输出"}'
 
 
-def probe(python=PYTHON, *, online=False):
+def probe(python=PYTHON, *, online=False, cancellation=None):
     if not Path(python).is_file():
         return {'available': False, 'python': str(python), 'reason': '未包含语音组件。请解压完整语音包（voice-runtime、tools 和 models）到程序目录；开发环境可设置 WECHAT_ARCHIVE_VOICE_PYTHON。', 'models': []}
     try:
-        result = run_worker(python, '--probe', *(['--decoder-only'] if online else []), timeout=60)
+        result = run_worker(python, '--probe', *(['--decoder-only'] if online else []), timeout=60, **({'cancellation': cancellation} if cancellation else {}))
         if result.returncode or not result.stdout:
             raise RuntimeError(process_failure(result))
         info = json.loads(result.stdout)
@@ -78,13 +84,13 @@ def find_media(db_dir, username, message):
     return matches[0]
 
 
-def recognize(media, model, python=PYTHON, *, details=False):
+def recognize(media, model, python=PYTHON, *, details=False, cancellation=None):
     with tempfile.TemporaryDirectory() as tmp:
         source, output = Path(tmp) / 'voice.bin', Path(tmp) / 'result.json'
         source.write_bytes(media)
         try:
             process = run_worker(python, '--audio', str(source), '--model', str(model),
-                                 '--output', str(output), timeout=1800)
+                                 '--output', str(output), timeout=1800, **({'cancellation': cancellation} if cancellation else {}))
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError('本地识别超时：单条语音处理超过 1800 秒') from exc
         if not output.exists():
@@ -112,14 +118,16 @@ def validate_api(config):
         raise ValueError('阿里接口需要 API Key')
 
 
-def recognize_online(media, config, python=PYTHON):
+def recognize_online(media, config, python=PYTHON, *, cancellation=None, progress=lambda *args: None):
     validate_api(config)
     with tempfile.TemporaryDirectory() as tmp:
         source, wav = Path(tmp) / 'voice.bin', Path(tmp) / 'voice.wav'
         source.write_bytes(media)
-        process = run_worker(python, '--audio', str(source), '--decode-output', str(wav), timeout=180)
+        process = run_worker(python, '--audio', str(source), '--decode-output', str(wav), timeout=180,
+                             **({'cancellation': cancellation} if cancellation else {}))
         if process.returncode or not wav.is_file():
             raise RuntimeError('在线识别前音频解码失败：' + process_failure(process))
+        progress('正在发送或等待在线识别请求（最长 180 秒）', 0, 0)
         return request_online(wav.read_bytes(), config)
 
 
@@ -164,12 +172,16 @@ def request_online(audio, config):
 
 
 def transcribe(archive, db_dir, usernames, model, progress=lambda *args: None, recognizer=recognize,
-               targets=None, force=False):
+               targets=None, force=False, cancellation=None, on_publish=lambda counts: None):
     selected = archive.voice_targets(usernames, targets)
     counts = {'success': 0, 'reused': 0, 'missing': 0, 'failed': 0}
     errors = {}
     for index, (username, m) in enumerate(selected):
-        progress('提取与语音转写', index, len(selected))
+        try:
+            progress('提取与语音转写', index, len(selected))
+        except TaskCancelled as exc:
+            exc.result = dict(counts, remaining=len(selected) - index)
+            raise
         key = m['message_id']
         old = archive.transcript(username, key)
         media, source = None, None
@@ -182,13 +194,17 @@ def transcribe(archive, db_dir, usernames, model, progress=lambda *args: None, r
                         raise RuntimeError('本地媒体缺失，无法重新识别；已保留原成功转写')
                     counts['reused'] += 1
                     continue
-                archive.save_transcript(username, key, None, 'media_missing', reason='本地未缓存关联语音媒体')
+                save = lambda: archive.save_transcript(username, key, None, 'media_missing', reason='本地未缓存关联语音媒体')
+                cancellation.publish(save) if cancellation else save()
                 counts['missing'] += 1
+                on_publish(counts)
                 continue
             if not force and old and old[0] == media and old[1] == 'success':
                 counts['reused'] += 1
                 continue
             result = recognizer(media, model)
+            if cancellation:
+                cancellation.check()
             text = result['text'] if isinstance(result, dict) else result
             if isinstance(result, dict):
                 source.update({k: result[k] for k in ('provider', 'model', 'device', 'device_name') if k in result})
@@ -197,18 +213,40 @@ def transcribe(archive, db_dir, usernames, model, progress=lambda *args: None, r
                     counts.setdefault('notes', [])
                     if result['device_reason'] not in counts['notes']:
                         counts['notes'].append(result['device_reason'])
-            archive.save_transcript(username, key, media, 'success', text=text, source=source)
+            save = lambda: archive.save_transcript(username, key, media, 'success', text=text, source=source)
+            cancellation.publish(save) if cancellation else save()
             counts['success'] += 1
+            on_publish(counts)
+        except TaskCancelled as exc:
+            exc.result = dict(counts, remaining=len(selected) - index)
+            raise
         except Exception as exc:
+            if cancellation:
+                try:
+                    cancellation.check()
+                except TaskCancelled as cancelled:
+                    cancelled.result = dict(counts, remaining=len(selected) - index)
+                    raise
             reason = f'{type(exc).__name__}：{exc}'
-            if force and old and old[1] == 'success':
-                archive.record_transcript_error(username, key, reason)
-            else:
-                archive.save_transcript(username, key, media, 'tool_unavailable' if isinstance(exc, ToolUnavailable) else 'failed',
-                                        reason=reason, source=source)
+            def save_failure():
+                if force and old and old[1] == 'success':
+                    archive.record_transcript_error(username, key, reason)
+                else:
+                    archive.save_transcript(username, key, media, 'tool_unavailable' if isinstance(exc, ToolUnavailable) else 'failed',
+                                            reason=reason, source=source)
+            try:
+                cancellation.publish(save_failure) if cancellation else save_failure()
+            except TaskCancelled as cancelled:
+                cancelled.result = dict(counts, remaining=len(selected) - index)
+                raise
             errors[reason] = errors.get(reason, 0) + 1
             counts['failed'] += 1
-    progress('完成', len(selected), len(selected))
+            on_publish(counts)
+    try:
+        progress('完成', len(selected), len(selected))
+    except TaskCancelled as exc:
+        exc.result = dict(counts, remaining=0)
+        raise
     if errors:
         counts['errors'] = [{'reason': reason, 'count': count} for reason, count in errors.items()]
     return counts

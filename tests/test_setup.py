@@ -53,7 +53,7 @@ class SetupTests(unittest.TestCase):
                         Path(command[-1]).write_text('{}')
                     return subprocess.CompletedProcess(command,exitcode,b'private-output',b'private-output')
                 task = {'status':'running'}
-                with patch.object(subprocess,'run',side_effect=run):
+                with patch('supervised_process.run',side_effect=run):
                     manager.perform(account,archive,task,'extract',[])
                 self.assertEqual(task['diagnostic_code'],expected)
                 self.assertEqual(task['status'],'success' if expected in ('complete','partial') else 'failed')

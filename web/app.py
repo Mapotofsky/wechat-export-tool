@@ -87,6 +87,10 @@ class TaskReq(BaseModel):
     voice_targets: list[VoiceTarget] | None = None
 
 
+class CancelTaskReq(BaseModel):
+    account_id: str
+
+
 class FollowReq(BaseModel):
     usernames: list[str]
 
@@ -115,8 +119,11 @@ def save_view_state(req: ViewStateReq):
             raise ValueError('账号已切换，未保存旧账号阅读位置')
         if req.offset < 0 or req.scroll < 0:
             raise ValueError('阅读位置不能小于零')
-        manager.archive().require_visible([req.active])
-        manager.archive().save_config({'view_state': req.model_dump(exclude={'account_id'})})
+        archive = manager.archive()
+    # A long import can hold SQLite's write lock. Do not hold the task lock
+    # while waiting: cancellation must still reach the import's next boundary.
+    archive.require_visible([req.active])
+    archive.save_config({'view_state': req.model_dump(exclude={'account_id'})})
     return {'saved': True}
 
 
@@ -226,6 +233,16 @@ def task_preview(req: TaskReq):
                 raise ValueError('仅语音转写支持消息选择')
             manager.archive().voice_targets(result['usernames'], [t.model_dump() for t in req.voice_targets])
         return result
+
+
+@app.post('/api/tasks/{task_id}/cancel')
+def cancel_task(task_id: str, req: CancelTaskReq):
+    return manager.cancel(task_id, req.account_id)
+
+
+@app.post('/api/tasks/{task_id}/cleanup')
+def retry_task_cleanup(task_id: str, req: CancelTaskReq):
+    return manager.retry_task_cleanup(task_id, req.account_id)
 
 
 class VoiceQuery(BaseModel):

@@ -59,12 +59,16 @@ def wait_ready(url, thread, timeout=30):
 
 
 class NativeBridge:
-    def __init__(self, base_url, busy):
+    def __init__(self, base_url, busy, manager=None):
         self._base_url = base_url
         self._busy = busy
         self._window = None
         self._last_saved = None
         self._saving = False
+        self._state_lock = threading.RLock()
+        self._closing = False
+        self._manager = manager
+        self._exit_waiting = False
 
     def choose_directory(self):
         import webview
@@ -74,9 +78,10 @@ class NativeBridge:
     def save_export(self, request):
         """Download bytes from the same API used by the browser, then save natively."""
         import webview
-        if self._saving:
-            return {'saved': False, 'error': '正在保存导出文件'}
-        self._saving = True
+        with self._state_lock:
+            if self._saving or self._closing:
+                return {'saved': False, 'error': '正在保存导出文件或退出'}
+            self._saving = True
         try:
             export_format = request.get('format', 'zip')
             extension = export_format if export_format in ('txt', 'json') else 'zip'
@@ -107,7 +112,8 @@ class NativeBridge:
         except (OSError, ValueError) as exc:
             return {'saved': False, 'error': str(exc)}
         finally:
-            self._saving = False
+            with self._state_lock:
+                self._saving = False
 
     def open_path(self, path):
         target = Path(path).resolve()
@@ -124,9 +130,37 @@ class NativeBridge:
         return True
 
     def _can_close(self):
-        if self._busy() or self._saving:
+        with self._state_lock:
+            return self._can_close_locked()
+
+    def _can_close_locked(self):
+        if self._saving or not self._manager or getattr(self._manager, 'cleanup', None):
+            if not (self._busy() or self._saving):
+                self._closing = True
+                return True
             self._window.create_confirmation_dialog('任务仍在运行', '请等待任务完成后退出；可以最小化窗口继续处理。')
             return False
+        if self._busy():
+            if self._exit_waiting:
+                return False
+            if self._window.create_confirmation_dialog('任务仍在运行', '选择“确定”停止任务后退出；选择“取消”继续等待，可最小化窗口。提交中的任务将等待实际结果。'):
+                with self._manager.lock:
+                    task = self._manager.task
+                    if task:
+                        self._manager.cancel(task['id'], task['account_id'])
+                self._exit_waiting = True
+                def wait_and_close():
+                    while True:
+                        with self._state_lock:
+                            if not self._busy() and not self._saving:
+                                self._closing = True
+                                self._exit_waiting = False
+                                break
+                        time.sleep(.1)
+                    self._window.destroy()
+                threading.Thread(target=wait_and_close, daemon=True).start()
+            return False
+        self._closing = True
         return True
 
 
@@ -181,7 +215,7 @@ def main(argv=None):
         thread.start()
         url = f'http://127.0.0.1:{port}'
         wait_ready(url, thread)
-        bridge = NativeBridge(url, manager.busy)
+        bridge = NativeBridge(url, manager.busy, manager)
         window = webview.create_window('微信聊天档案', url, js_api=bridge, width=1366, height=860,
                                        min_size=(900, 600))
         bridge._window = window

@@ -26,7 +26,7 @@ else:
     # Deterministic local mock; no audio, process scan or external API is used.
     import voice_service
     voice_service.probe = lambda **kwargs: {'available': True, 'models': [], 'silk': True, 'ffmpeg': True}
-    def mock_transcribe(archive, db_dir, users, model, progress, recognizer, targets=None, force=False):
+    def mock_transcribe(archive, db_dir, users, model, progress, recognizer, targets=None, force=False, cancellation=None, on_publish=lambda counts: None):
         rows = archive.voice_targets(users, targets)
         success, reused = 0, 0
         for index, (u, message) in enumerate(rows):

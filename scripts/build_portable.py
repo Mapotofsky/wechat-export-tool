@@ -20,7 +20,7 @@ PREREQUISITES = {
 }
 PROGRAM_FILES = ('archive_store.py', 'archive_analysis.py', 'analysis_lexicon.py', 'encrypted_sync.py', 'local_asr.py', 'maintenance.py',
     'voice_service.py', 'wcdb_key_tool_windows.py', 'wechat_export.py', 'run.py',
-    'runtime_paths.py', 'desktop.py')
+    'runtime_paths.py', 'desktop.py', 'task_lifecycle.py', 'supervised_process.py')
 
 
 def run(*args):

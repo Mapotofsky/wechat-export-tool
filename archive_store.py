@@ -106,9 +106,10 @@ class Archive:
         return list(rows.values())
 
     @staticmethod
-    def source_sessions(db_dir):
+    def source_sessions(db_dir, progress=lambda *args: None):
         users = set()
         for path in sorted((Path(db_dir) / 'message').glob('message_*.db')):
+            progress('发现历史会话', len(users), 0)
             if not we.is_message_shard(path.name):
                 continue
             with closing(we._connect_ro(str(path))) as c:
@@ -197,13 +198,16 @@ class Archive:
             result.update(self.reclaim_space())
         return result
 
-    def prepare_directory(self, db_dir, discover=False):
+    def prepare_directory(self, db_dir, discover=False, settings=None, before_publish=lambda: None, progress=lambda *args: None):
         rows = {r['username']: r for r in self.config().get('contact_directory', [])}
         rows.update({r['username']: r for r in we.load_contacts(str(db_dir), include_official=True, only_with_msg=False)})
         if discover:
-            for u in self.source_sessions(db_dir):
+            for u in self.source_sessions(db_dir, progress):
                 rows.setdefault(u, {'username': u, 'name': u, 'category': we.classify_username(u)})
-        self.save_config({'contact_directory': list(rows.values()), 'decrypted_dir': str(db_dir)})
+        values = dict(settings or {})
+        values.update({'contact_directory': list(rows.values()), 'decrypted_dir': str(db_dir)})
+        before_publish()
+        self.save_config(values)
         return len(rows)
 
     @staticmethod
@@ -391,14 +395,14 @@ class Archive:
         progress('核对导入签名', 0, 0)
         phase = time.perf_counter()
         if plaintext:
-            signatures = self._source_signatures(db_dir, include_media)
+            signatures = self._source_signatures(db_dir, include_media, progress)
         metrics['signature_seconds'] = time.perf_counter() - phase
         with we.MessageReader(db_dir, config.get('self_username')) as reader:
             return self._update(reader, config, progress, settings, signatures, metrics, started, plaintext,
                                 usernames, include_media)
 
     @staticmethod
-    def _source_signatures(db_dir, include_media=True):
+    def _source_signatures(db_dir, include_media=True, progress=lambda *args: None):
         from encrypted_sync import file_digest, stable_files
         db_dir = Path(db_dir)
         paths = [db_dir / 'contact' / 'contact.db'] + sorted((db_dir / 'message').glob('*.db'))
@@ -407,8 +411,8 @@ class Archive:
         # Pin only while fingerprinting, rather than blocking a live plaintext writer
         # for the whole import. A changed source before commit causes rollback.
         with stable_files(files):
-            return {p.relative_to(db_dir).as_posix(): {'signature': [file_digest(p),
-                file_digest(Path(str(p) + '-wal')) if Path(str(p) + '-wal').exists() and Path(str(p) + '-wal').stat().st_size else None]}
+            return {p.relative_to(db_dir).as_posix(): {'signature': [file_digest(p, progress),
+                file_digest(Path(str(p) + '-wal'), progress) if Path(str(p) + '-wal').exists() and Path(str(p) + '-wal').stat().st_size else None]}
                 for p in paths}
 
     def _update(self, reader, config, progress, settings, signatures, metrics, started, plaintext, selected, include_media):
@@ -499,6 +503,7 @@ class Archive:
                 processed, last_progress = 0, time.monotonic()
                 iterator = iter(messages)
                 while True:
+                    progress(f'读取消息批次（会话 {index + 1}/{len(contacts)}）', index, len(contacts))
                     phase = time.perf_counter()
                     batch = list(itertools.islice(iterator, 256))
                     metrics['read_parse_seconds'] += time.perf_counter() - phase
@@ -556,7 +561,7 @@ class Archive:
             if plaintext:
                 phase = time.perf_counter()
                 progress('复核明文源库签名', len(contacts), len(contacts))
-                final_signatures = {k: v['signature'] for k, v in self._source_signatures(db_dir, include_media).items()}
+                final_signatures = {k: v['signature'] for k, v in self._source_signatures(db_dir, include_media, progress).items()}
                 metrics['signature_seconds'] += time.perf_counter() - phase
                 if final_signatures != signatures:
                     raise RuntimeError('明文源库在导入期间发生变化，未发布本次导入；请稳定源库后重试')
