@@ -34,7 +34,8 @@ class UsabilityTests(unittest.TestCase):
             self.assertTrue({'wxid_a', 'test@chatroom', 'second@chatroom'} <= set(usernames))
             group = next(r for r in rows if r['username'] == 'second@chatroom')
             self.assertIn('已收录发送者', ' '.join(group['match_reasons']))
-        self.assertTrue({'wxid_a', 'wxid_b'} <= {r['username'] for r in web.contacts(q='项目备注')})
+        self.assertIn('wxid_a', {r['username'] for r in web.contacts(q='项目备注')})
+        self.assertNotIn('wxid_b', {r['username'] for r in web.contacts(q='项目备注')})
 
     def test_activity_is_real_message_and_unknown_is_explicit(self):
         start, end = 1700086400, 1700172800
@@ -42,7 +43,7 @@ class UsabilityTests(unittest.TestCase):
         self.assertNotIn('wxid_a', {r['username'] for r in rows})
         self.assertIn('second@chatroom', {r['username'] for r in rows})
         self.assertNotIn('pending', {r['username'] for r in rows})
-        self.assertIn('pending', {r['username'] for r in web.contacts(start=start, end=end, date_mode='activity', include_unknown=True)})
+        self.assertNotIn('pending', {r['username'] for r in web.contacts(start=start, end=end, date_mode='activity', include_unknown=True)})
 
     def test_preview_pages_count_and_export_share_range(self):
         username = 'second@chatroom'

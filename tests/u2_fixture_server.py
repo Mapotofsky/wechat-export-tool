@@ -10,6 +10,7 @@ parser.add_argument('--root', type=Path, required=True)
 parser.add_argument('--port', type=int, default=8772)
 parser.add_argument('--prepare-only', action='store_true')
 parser.add_argument('--fail-reclaim-once', action='store_true')
+parser.add_argument('--large-directory', action='store_true')
 args = parser.parse_args()
 args.root = args.root.resolve()
 args.root.mkdir(parents=True, exist_ok=True)
@@ -18,6 +19,13 @@ sys.path[:0] = [str(Path(__file__).resolve().parent.parent), str(Path(__file__).
 from u2_synthetic import prepare
 from web import app as web
 web.manager, source = prepare(args.root)
+if args.large_directory:
+    import sqlite3
+    from contextlib import closing
+    with closing(sqlite3.connect(source / 'contact/contact.db')) as c, c:
+        c.executemany('INSERT INTO contact VALUES (?,?,3,?,?)',
+                      [(f'contact_only_{i}', '', f'仅目录项{i}', '') for i in range(2000)])
+    web.manager.archive().prepare_directory(source)
 if args.prepare_only:
     web.manager.executor.shutdown()
     print(str(args.root / 'state'))

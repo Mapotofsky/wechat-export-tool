@@ -429,13 +429,13 @@ class Manager:
                             (False, json.dumps(usernames))).fetchone())
                     db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
                                                           config['keys_file'], [db_dir, config.get('message_snapshot'), config.get('media_snapshot')], progress,
-                                                          contacts_only=action == 'prepare', media=media_needed)
+                                                          contacts_only=False, media=media_needed)
                     generation = db_dir
                 if action in ('prepare', 'discover'):
                     published = {}
                     if account['mode'] == 'encrypted':
                         published['keys_error'] = ''
-                        snapshot = db_dir if action == 'discover' else config.get('message_snapshot') or config.get('decrypted_dir')
+                        snapshot = db_dir
                         if snapshot:
                             published['message_snapshot'] = str(snapshot)
                     count = archive.prepare_directory(db_dir, discover=action == 'discover', settings=published,

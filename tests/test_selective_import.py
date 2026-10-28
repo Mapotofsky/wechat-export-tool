@@ -69,7 +69,7 @@ class SelectiveTests(unittest.TestCase):
         with patch.object(we, 'parse_message', side_effect=AssertionError('catalog must not parse bodies')):
             run('prepare')
             self.assertEqual(archive.contacts(), [])
-            self.assertNotIn(self.b, {r['username'] for r in archive.directory_contacts()})
+            self.assertIn(self.b, {r['username'] for r in archive.directory_contacts()})
             candidate = identity_candidates(archive.config()['decrypted_dir'], 'public_id')[0]
             self.assertEqual(candidate['username'], 'wxid_self')
             run('discover')
@@ -109,7 +109,7 @@ class SelectiveTests(unittest.TestCase):
     def test_contacts_and_discovery_do_not_read_bodies(self):
         with patch.object(we, 'MessageReader', side_effect=AssertionError('reader')), patch.object(we, 'parse_message', side_effect=AssertionError('parse')):
             self.archive.prepare_directory(self.source)
-            self.assertNotIn(self.b, {r['username'] for r in self.archive.directory_contacts()})
+            self.assertIn(self.b, {r['username'] for r in self.archive.directory_contacts()})
             self.archive.prepare_directory(self.source, discover=True)
         directory = {r['username']: r for r in self.archive.directory_contacts()}
         self.assertIn(self.b, directory)

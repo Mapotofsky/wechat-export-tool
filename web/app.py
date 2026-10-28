@@ -420,7 +420,8 @@ def contacts(q: str = '', category: str = '', start: int | None = None, end: int
         rows = [r for r in rows if r['username'] in members]
     q = q.strip().casefold()
     fields = ('name', 'remark', 'nick_name', 'alias', 'username')
-    matches = {r['username']: r for r in rows if q and any(q in (r.get(k) or '').casefold() for k in fields)}
+    names = manager.archive().config().get('contact_directory', []) if q and manager.account() else []
+    matches = {r['username']: r for r in [*names, *rows] if q and any(q in (r.get(k) or '').casefold() for k in fields)}
     result = []
     for r in rows:
         reasons = []

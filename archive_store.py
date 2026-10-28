@@ -78,9 +78,17 @@ class Archive:
                 c.execute('BEGIN')
                 return self.directory_contacts(include_hidden, c)
         config = {k: json.loads(v) for k, v in connection.execute('SELECT key,value FROM settings')}
+        source = config.get('message_snapshot') or config.get('decrypted_dir')
+        sessions = set(self.source_sessions(source)) if source else set()
+        if include_hidden:
+            sessions.update(config.get('hidden_usernames', []))
         rows = {r['username']: dict(r, total=0, first_timestamp=None, last_timestamp=None,
                 preview='', recorded_senders=[], recorded_sender_count=0, imported=False)
-                for r in config.get('contact_directory', [])}
+                for r in config.get('contact_directory', []) if r['username'] in sessions}
+        for u in sessions:
+            rows.setdefault(u, dict(username=u, name=u, category=we.classify_username(u),
+                total=0, first_timestamp=None, last_timestamp=None, preview='',
+                recorded_senders=[], recorded_sender_count=0, imported=False))
         for r in self.contacts(connection):
             rows[r['username']] = dict(rows.get(r['username'], {}), **r, imported=True)
         followed = set(config.get('followed_usernames', []))
@@ -93,30 +101,25 @@ class Archive:
             raise ValueError('范围包含隐藏会话；请先在隐藏会话管理中恢复')
 
     def maintenance_contacts(self):
-        """All-update also includes historical sessions in the prepared source catalog."""
-        rows = {r['username']: r for r in self.directory_contacts()}
-        config = self.config()
-        hidden = set(config.get('hidden_usernames', []))
-        source = config.get('message_snapshot') or config.get('decrypted_dir')
-        if source:
-            for u in self.source_sessions(source):
-                if u not in hidden:
-                    rows.setdefault(u, dict(username=u, name=u, category=we.classify_username(u),
-                                            imported=False, total=0, first_timestamp=None, last_timestamp=None))
-        return list(rows.values())
+        """Preview and execution use the same visible conversation catalog."""
+        return self.directory_contacts()
 
     @staticmethod
     def source_sessions(db_dir, progress=lambda *args: None):
         users = set()
+        hashes = set()
         for path in sorted((Path(db_dir) / 'message').glob('message_*.db')):
             progress('发现历史会话', len(users), 0)
             if not we.is_message_shard(path.name):
                 continue
             with closing(we._connect_ro(str(path))) as c:
                 tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                hashes.update(t[4:] for t in tables if t.startswith('Msg_'))
                 if 'Name2Id' in tables:
                     users.update(u for (u,) in c.execute('SELECT user_name FROM Name2Id')
                                  if u and 'Msg_' + hashlib.md5(u.encode()).hexdigest() in tables)
+        users.update(r['username'] for r in we.load_contacts(str(db_dir), include_official=True, only_with_msg=False)
+                     if hashlib.md5(r['username'].encode()).hexdigest() in hashes)
         return sorted(users)
 
     def groups(self):

@@ -14,6 +14,40 @@ from fastapi.testclient import TestClient
 
 
 class U2Tests(unittest.TestCase):
+    def test_large_directory_does_not_expand_conversations_or_execution(self):
+        from test_maintenance import shard
+        with closing(sqlite3.connect(self.source / 'contact/contact.db')) as c, c:
+            c.executemany('INSERT INTO contact VALUES (?,?,3,?,?)',
+                          [(f'contact_only_{i}', '', f'目录项{i}', '') for i in range(2000)])
+        historical = 'outside_directory@chatroom'
+        shard(self.source, 8, historical, [(1, 88001, 1, 8, 1700000000, 'history', 0)])
+        with closing(sqlite3.connect(self.source / 'message/message_8.db')) as c, c:
+            c.execute('INSERT INTO Name2Id VALUES (?,1)', (historical,))
+        self.archive.update(self.source, usernames=[historical])
+        (self.source / 'message/message_8.db').unlink()
+        pending_history = 'pending_outside@chatroom'
+        shard(self.source, 9, pending_history, [])
+        with closing(sqlite3.connect(self.source / 'message/message_9.db')) as c, c:
+            c.execute('INSERT INTO Name2Id VALUES (?,1)', (pending_history,))
+        self.archive.prepare_directory(self.source)
+        expected = {username(i) for i in range(320)} | {'test@chatroom', historical, pending_history}
+        self.assertGreater(len(self.archive.config()['contact_directory']), 2000)
+        self.archive.set_hidden([username(0)])
+        expected.remove(username(0))
+        self.assertEqual({r['username'] for r in web.contacts()}, expected)
+        preview = web.task_preview(web.TaskReq(action='update_all', account_id=self.account))
+        self.assertEqual(set(preview['usernames']), expected)
+        self.assertEqual({r['username'] for r in preview['pending']},
+                         {username(i) for i in range(160, 320)} | {'test@chatroom', pending_history})
+        task = web.task(web.TaskReq(action='update_all', account_id=self.account, usernames=preview['usernames']))
+        self.manager.executor.submit(lambda: None).result(timeout=30)
+        self.assertEqual(self.manager.task['status'], 'success', self.manager.task.get('reason'))
+        self.assertEqual(set(task['selected_usernames']), expected)
+        self.assertEqual({r['username'] for r in self.archive.contacts()}, expected | {username(0)})
+        self.assertEqual(self.archive.message_count(historical), 1)
+        self.assertEqual(self.archive.transcript(username(0), 'server:10001')[1], 'success')
+        self.assertEqual(self.archive.config()['followed_usernames'], [username(0), username(159), username(200)])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='u2-data-')
         self.addCleanup(self.tmp.cleanup)
@@ -44,13 +78,13 @@ class U2Tests(unittest.TestCase):
             web.save_hidden(web.HiddenReq(account_id=self.account,usernames=[username(0)],purge=True))
 
     def test_conditions_320_complete_set_unknown_count_and_dates(self):
-        self.assertEqual(len(self.selection(category='friend,group')), 324)
+        self.assertEqual(len(self.selection(category='friend,group')), 321)
         self.assertEqual(len(self.selection(archive_state='imported')), 160)
-        self.assertEqual(len(self.selection(archive_state='pending')), 164)
+        self.assertEqual(len(self.selection(archive_state='pending')), 161)
         self.assertEqual(len(self.selection(min_count=0, max_count=0)), 0)
-        self.assertEqual(len(self.selection(min_count=0, max_count=0, include_unknown=True)), 164)
+        self.assertEqual(len(self.selection(min_count=0, max_count=0, include_unknown=True)), 161)
         self.assertEqual(self.selection(last_end=1700000001), [username(0)])
-        self.assertEqual(len(self.selection(last_end=1700000001, include_unknown=True)), 165)
+        self.assertEqual(len(self.selection(last_end=1700000001, include_unknown=True)), 162)
         self.assertEqual(len(self.selection(filters={'q':'合成群'}, archive_state='pending')), 80)
         self.assertIn(username(319), self.selection(filters={'q':'319'}))
 
@@ -62,7 +96,7 @@ class U2Tests(unittest.TestCase):
         self.assertEqual(len(preview['pending']), 2)
         self.assertEqual(preview['excluded'], [username(0)])
         self.assertEqual(web.task_preview(web.TaskReq(action='update', account_id=self.account))['usernames'], [username(159),username(200)])
-        self.assertEqual(web.task_preview(web.TaskReq(action='update_all', account_id=self.account))['usernames'].__len__(), 323)
+        self.assertEqual(web.task_preview(web.TaskReq(action='update_all', account_id=self.account))['usernames'].__len__(), 320)
         self.assertEqual(web.task_preview(web.TaskReq(action='update', account_id=self.account, usernames=[]))['usernames'], [])
         with self.assertRaisesRegex(ValueError, '为空'):
             web.task(web.TaskReq(action='update_all', account_id=self.account, usernames=[]))
@@ -71,7 +105,7 @@ class U2Tests(unittest.TestCase):
         with patch.object(self.manager.executor, 'submit') as dispatch:
             task = web.task(web.TaskReq(account_id=self.account, action='update_all'))
             users = task['selected_usernames'][:]
-            self.assertEqual(len(users), 324)
+            self.assertEqual(set(users), {username(i) for i in range(320)} | {'test@chatroom'})
             self.assertEqual(dispatch.call_args.args[-1], users)
             self.archive.save_config({'followed_usernames': [username(1)]})
             self.manager.task = None

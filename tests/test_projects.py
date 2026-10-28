@@ -32,6 +32,8 @@ class ProjectTests(unittest.TestCase):
         return web.save_group(web.GroupReq(name=name, usernames=members))['id']
 
     def test_overlapping_groups_followed_types_and_fixed_task_scope(self):
+        # A pending conversation needs a source message table, not just a contact.
+        shard(self.source, 2, 'wxid_b', [])
         first = self.create_group('项目一', [self.chat, 'wxid_a', self.chat, 'wxid_b'])
         second = self.create_group('项目二', [self.chat])
         scope = web.group_scope(first)
