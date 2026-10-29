@@ -59,7 +59,7 @@ def load_rows(archive, c, usernames, start, end, q, include_transcripts):
         condition, values = archive.search_condition(username, q, start, end,
                                                      include_transcripts=include_transcripts)
         base, bounds = archive.search_condition(username, start=start, end=end)
-        sql = '''SELECT m.message_key,m.data,t.status,t.text,t.reason,
+        sql = '''SELECT m.message_key,m.data,CASE WHEN EXISTS(SELECT 1 FROM voice_skips s WHERE s.username=m.username AND s.message_key=m.message_key) THEN 'skipped' ELSE t.status END,t.text,t.reason,
             CASE WHEN ''' + condition + ''' THEN 1 ELSE 0 END
             FROM messages m LEFT JOIN transcripts t
             ON t.username=m.username AND t.message_key=m.message_key WHERE ''' + base + '''

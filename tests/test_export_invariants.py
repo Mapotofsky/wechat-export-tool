@@ -252,8 +252,10 @@ class ExportInvariantTests(unittest.TestCase):
         manager.select(str(self.root), 'synthetic', True)
         manager.archive().update(self.root)
         with patch.object(web_app, "manager", manager):
-            self.assertTrue(web_app.data_status()['has_data'])
-            self.assertEqual(web_app.data_status()['contacts'], 1)
+            with patch.object(manager.archive(), 'contacts', side_effect=AssertionError('状态轮询不应读取完整会话元数据')):
+                status = web_app.data_status()
+            self.assertTrue(status['has_data'])
+            self.assertNotIn('contacts', status)
             self.assertEqual(web_app.contacts()[0]["username"], username)
             response = web_app.export(web_app.ExportReq(account_id=manager.account()['id'], usernames=[username]))
 

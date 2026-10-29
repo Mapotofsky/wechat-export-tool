@@ -26,7 +26,7 @@ class MatchingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             manager=Manager(tmp)
             try:
-                manager.registry={'active':'a','accounts':[{'id':'a'}]}
+                manager.registry={'active':'a','accounts':[{'id':'a','directory':tmp,'mode':'plaintext','label':'合成账号'}]}
                 archive=manager.archive()
                 archive.save_config({'contact_directory':[{'username':str(i)} for i in range(1000)],'self_username':'self'})
                 status=manager.status()

@@ -123,11 +123,12 @@ def recognize_online(media, config, python=PYTHON, *, cancellation=None, progres
     with tempfile.TemporaryDirectory() as tmp:
         source, wav = Path(tmp) / 'voice.bin', Path(tmp) / 'voice.wav'
         source.write_bytes(media)
+        progress('正在解码当前语音')
         process = run_worker(python, '--audio', str(source), '--decode-output', str(wav), timeout=180,
                              **({'cancellation': cancellation} if cancellation else {}))
         if process.returncode or not wav.is_file():
             raise RuntimeError('在线识别前音频解码失败：' + process_failure(process))
-        progress('正在发送或等待在线识别请求（最长 180 秒）', 0, 0)
+        progress('正在发送并等待当前语音响应')
         return request_online(wav.read_bytes(), config)
 
 
@@ -174,7 +175,10 @@ def request_online(audio, config):
 def transcribe(archive, db_dir, usernames, model, progress=lambda *args: None, recognizer=recognize,
                targets=None, force=False, cancellation=None, on_publish=lambda counts: None):
     selected = archive.voice_targets(usernames, targets)
-    counts = {'success': 0, 'reused': 0, 'missing': 0, 'failed': 0}
+    skipped = archive.skipped_voices()
+    omitted = sum((u, m['message_id']) in skipped for u, m in selected)
+    selected = [(u, m) for u, m in selected if (u, m['message_id']) not in skipped]
+    counts = {'success': 0, 'reused': 0, 'missing': 0, 'failed': 0, 'skipped': omitted}
     errors = {}
     for index, (username, m) in enumerate(selected):
         try:

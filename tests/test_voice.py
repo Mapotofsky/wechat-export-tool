@@ -153,6 +153,70 @@ class VoiceManagementTests(unittest.TestCase):
         self.assertEqual(result['failed'], 1)
         self.assertEqual(self.archive.transcript(self.username, 'server:103')[1:], ('success', '原成功文本'))
 
+    def test_manual_skip_persists_reimport_restore_and_online_retry(self):
+        self.archive.save_transcript(self.username, 'server:103', b'media', 'failed', reason='空结果，可能为环境音')
+        with patch.object(web, 'manager', self.manager):
+            req = dict(account_id=self.manager.account()['id'], targets=self.targets, skipped=True)
+            web.voice_skip(web.VoiceSkipReq(**req))
+            preview = web.task_preview(web.TaskReq(account_id=req['account_id'], action='transcribe', usernames=[self.username]))
+            self.assertEqual(preview['voices'], dict(total=2, skipped=1, reusable=1, pending=0))
+            with self.assertRaises(ValueError):
+                web.voice_skip(web.VoiceSkipReq(**dict(req, account_id='other')))
+        restarted = Archive(self.archive.directory)
+        restarted.update(self.source)
+        row = restarted.voice_page([self.username], status='skipped')['messages'][0]
+        self.assertEqual(row['transcription']['reason'], '空结果，可能为环境音')
+        self.assertEqual(restarted.voice_page([self.username], status='failed')['total'], 0)
+        self.assertEqual(next(m for m in restarted.search(self.username)['messages'] if m['message_id']=='server:104')['transcription']['status'], 'success')
+        self.assertEqual(next(m for m in restarted.messages(self.username) if m['message_id']=='server:103')['transcription']['status'], 'skipped')
+        recognize = Mock(return_value={'text':'恢复后成功', 'provider':'openai'})
+        with patch.object(voice_service, 'find_media', return_value=(b'media', {})):
+            for force in (False, True):
+                result = voice_service.transcribe(restarted, self.source, [self.username], '', recognizer=recognize,
+                    targets=self.targets, force=force)
+                self.assertEqual(result['skipped'], 1)
+                recognize.assert_not_called()
+            restarted.set_voice_skipped(self.targets, False)
+            result = voice_service.transcribe(restarted, self.source, [self.username], '', recognizer=recognize,
+                targets=self.targets, force=True)
+        self.assertEqual(result['success'], 1)
+        self.assertEqual(restarted.transcript(self.username, 'server:103')[2], '恢复后成功')
+        self.assertFalse(restarted.skipped_voices())
+
+    def test_batch_skip_rejects_success_atomically(self):
+        self.archive.save_transcript(self.username, 'server:103', b'media', 'failed', reason='失败')
+        targets = self.targets + [{'username':self.username, 'message_id':'server:104'}]
+        with self.assertRaises(ValueError):
+            self.archive.set_voice_skipped(targets, True)
+        self.assertFalse(self.archive.skipped_voices())
+        self.archive.save_transcript(self.username, 'server:104', b'media', 'failed', reason='第二条失败')
+        self.archive.set_voice_skipped(targets, True)
+        self.assertEqual(self.archive.voice_page([self.username], 'skipped')['total'], 2)
+        with patch.object(voice_service, 'probe') as probe:
+            self.manager.submit('transcribe', [self.username], account_id=self.manager.account()['id'])
+            self.manager.executor.shutdown()
+            probe.assert_not_called()
+        self.assertEqual(self.manager.status()['task']['status'], 'success')
+        self.assertEqual(self.manager.status()['task']['result']['skipped'], 2)
+        self.archive.set_voice_skipped(targets, False)
+        self.assertEqual(self.archive.voice_page([self.username], 'failed')['total'], 2)
+
+    def test_skip_follows_local_identity_upgrade_and_changed_import(self):
+        path = self.source / 'message/message_0.db'
+        with closing(sqlite3.connect(path)) as c, c:
+            c.execute(f'INSERT INTO "{table(self.username)}" VALUES (5,0,34,8,1700000004,"voice",0)')
+        self.archive.update(self.source)
+        local_key = next(m['message_id'] for _, m in self.archive.voice_targets([self.username]) if m['local_id']==5)
+        self.archive.save_transcript(self.username, local_key, b'media', 'failed', reason='原失败原因')
+        self.archive.set_voice_skipped([dict(username=self.username, message_id=local_key)], True)
+        with closing(sqlite3.connect(path)) as c, c:
+            c.execute(f'UPDATE "{table(self.username)}" SET server_id=105,message_content="changed voice" WHERE local_id=5')
+        self.archive.update(self.source)
+        rows = self.archive.voice_page([self.username], 'skipped')['messages']
+        self.assertEqual([m['message_id'] for m in rows], ['server:105'])
+        self.assertEqual(rows[0]['transcription']['reason'], '原失败原因')
+        self.assertNotIn((self.username, local_key), self.archive.skipped_voices())
+
     def test_voice_pagination_status_search_and_scope_validation(self):
         self.assertEqual(self.archive.voice_page([self.username], q='原成功')['total'], 2)
         self.assertEqual(self.archive.voice_page([self.username], status='failed')['total'], 0)

@@ -184,6 +184,8 @@ class Manager:
                 self.cleanup['stage'] = f'任务资源清理未完成：{exc}；请重试'
                 raise
             task.pop('cleanup_resources', None)
+            if task.get('reason', '').startswith('任务资源清理失败'):
+                task.update(reason='', stage='资源清理完成')
             task.update(next_step='资源清理完成，可按原范围重新执行任务')
             atomic_json(path, task)
             self.cleanup = None
@@ -350,6 +352,11 @@ class Manager:
         def progress(stage, done=0, total=0):
             nonlocal last_publication
             with self.lock:
+                current_activity = ''
+                if stage.startswith(('读取消息批次（', '导入消息（')):
+                    current_activity, stage = stage, '导入消息'
+                if stage.startswith('解密与 WAL 合并'):
+                    stage = '解密与 WAL 合并'
                 if stage in ('提交消息档案', '提交通讯录', '提交密钥'):
                     cancellation.check()
                     task.update(cancellable=False, cancel_boundary='正在提交，等待实际结果')
@@ -359,16 +366,20 @@ class Manager:
                     if not task.get('cancellable', True):
                         task['publication'] = '已提交'
                     stage = '正在完成当前阶段'
-                unit = ('字节' if stage == '复制快照' else '页' if '页面' in stage else
-                        '条语音' if '语音转写' in stage else '个会话' if '导入消息' in stage or '会话元数据' in stage else
+                unit = (task.get('unit', '') if stage == '正在完成当前阶段' else
+                        '字节' if stage == '复制快照' else '页' if '页面' in stage else
+                        '帧' if stage == '验证加密 WAL 提交边界' else
+                        '条语音' if '语音转写' in stage else '个会话' if '导入消息' in stage or '会话元数据' in stage or stage == '发现历史会话' else
+                        '个会话' if stage in ('提交消息档案', '复核明文源库签名') else
                         '个数据库' if '稳定快照' in stage or '解密与 WAL' in stage else '')
-                if action in ('update', 'update_all', 'transcribe'):
-                    stage += (f" · 已选 {len(task['voice_targets'])} 条语音" if 'voice_targets' in task else
-                              ' · 全部会话' if action == 'update_all' else f' · 已选 {len(usernames)} 个会话')
-                task.update(stage=stage, done=done, total=total, unit=unit)
+                task.update(stage=stage, done=done, total=total, unit=unit, activity=current_activity)
                 if time.monotonic() - last_publication >= .5:
                     atomic_json(task_path, task)
                     last_publication = time.monotonic()
+        def activity(message, *_):
+            with self.lock:
+                cancellation.check()
+                task['activity'] = message
         try:
             config = archive.config()
             manifest = {}
@@ -459,40 +470,45 @@ class Manager:
             elif action == 'transcribe':
                 if not usernames:
                     raise ValueError('请先选择聊天')
-                if account['mode'] == 'encrypted':
-                    db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
-                        config['keys_file'], [config.get('decrypted_dir'), config.get('media_snapshot')], progress, contacts_only=True, media=True)
-                    generation = db_dir
-                    cancellation.publish(lambda: archive.save_config({'decrypted_dir': str(db_dir), 'media_snapshot': str(db_dir),
-                                         'message_snapshot': config.get('message_snapshot') or config.get('decrypted_dir')}))
-                    with self.lock:
-                        task['publication'] = '快照已发布；语音逐条发布'
-                    config['decrypted_dir'] = str(db_dir)
-                online = config.get('asr_provider', 'local') != 'local'
-                voice_service.validate_api(config)
-                progress('检查在线识别与音频工具' if online else '检查本地识别工具')
-                info = voice_service.probe(online=True, cancellation=cancellation) if online else voice_service.probe(cancellation=cancellation)
-                if not online and config.get('asr_model') and Path(config['asr_model']).is_file():
-                    info['available'] = bool(info.get('whisper') and info.get('ffmpeg'))
-                if not info['available']:
-                    raise voice_service.ToolUnavailable(info.get('reason', '本地识别工具不可用'))
-                model = config.get('asr_model') or next((m for m in info.get('models', []) if Path(m).name == 'small.pt'), '')
-                # Per-message failures are persisted; exports remain available.
-                def recognizer(media, chosen_model):
+                voice_plan = archive.voice_plan(usernames, task.get('voice_targets'))
+                if voice_plan['total'] == voice_plan['skipped']:
+                    result = voice_service.transcribe(archive, config.get('decrypted_dir', ''), usernames, '', progress,
+                        targets=task.get('voice_targets'), cancellation=cancellation)
+                else:
+                    if account['mode'] == 'encrypted':
+                        db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
+                            config['keys_file'], [config.get('decrypted_dir'), config.get('media_snapshot')], progress, contacts_only=True, media=True)
+                        generation = db_dir
+                        cancellation.publish(lambda: archive.save_config({'decrypted_dir': str(db_dir), 'media_snapshot': str(db_dir),
+                                             'message_snapshot': config.get('message_snapshot') or config.get('decrypted_dir')}))
+                        with self.lock:
+                            task['publication'] = '快照已发布；语音逐条发布'
+                        config['decrypted_dir'] = str(db_dir)
+                    online = config.get('asr_provider', 'local') != 'local'
+                    voice_service.validate_api(config)
+                    progress('检查在线识别与音频工具' if online else '检查本地识别工具')
+                    info = voice_service.probe(online=True, cancellation=cancellation) if online else voice_service.probe(cancellation=cancellation)
+                    if not online and config.get('asr_model') and Path(config['asr_model']).is_file():
+                        info['available'] = bool(info.get('whisper') and info.get('ffmpeg'))
                     if not info['available']:
                         raise voice_service.ToolUnavailable(info.get('reason', '本地识别工具不可用'))
-                    if media.startswith((b'\x02#!SILK_V3', b'#!SILK_V3')) and not info.get('silk'):
-                        raise voice_service.ToolUnavailable('缺少 SILK 解码工具 pilk')
-                    if online:
-                        return voice_service.recognize_online(media, config, cancellation=cancellation, progress=progress)
-                    result = voice_service.recognize(media, chosen_model, details=True, cancellation=cancellation)
-                    return dict(result, provider='local', model=chosen_model)
-                def voice_published(counts):
-                    with self.lock:
-                        task.update(publication='逐条发布', result=dict(counts))
-                result = voice_service.transcribe(archive, config['decrypted_dir'], usernames, model, progress, recognizer,
-                                                 targets=task.get('voice_targets'), force='voice_targets' in task, cancellation=cancellation,
-                                                 on_publish=voice_published)
+                    model = config.get('asr_model') or next((m for m in info.get('models', []) if Path(m).name == 'small.pt'), '')
+                    # Per-message failures are persisted; exports remain available.
+                    def recognizer(media, chosen_model):
+                        if not info['available']:
+                            raise voice_service.ToolUnavailable(info.get('reason', '本地识别工具不可用'))
+                        if media.startswith((b'\x02#!SILK_V3', b'#!SILK_V3')) and not info.get('silk'):
+                            raise voice_service.ToolUnavailable('缺少 SILK 解码工具 pilk')
+                        if online:
+                            return voice_service.recognize_online(media, config, cancellation=cancellation, progress=activity)
+                        result = voice_service.recognize(media, chosen_model, details=True, cancellation=cancellation)
+                        return dict(result, provider='local', model=chosen_model)
+                    def voice_published(counts):
+                        with self.lock:
+                            task.update(publication='逐条发布', result=dict(counts))
+                    result = voice_service.transcribe(archive, config['decrypted_dir'], usernames, model, progress, recognizer,
+                                                     targets=task.get('voice_targets'), force='voice_targets' in task, cancellation=cancellation,
+                                                     on_publish=voice_published)
             else:
                 raise ValueError('未知任务')
             if manifest:

@@ -222,5 +222,7 @@ class U2Tests(unittest.TestCase):
         self.assertTrue(result['saved'])
         self.assertFalse(result['space_reclaimed'])
         self.assertIn('synthetic disk full', result['warning'])
+        self.assertTrue(self.archive.config()['space_reclaim_pending'])
         self.assertEqual(self.archive.message_count(username(0)), 0)
         self.assertTrue(web.reclaim_space(web.HiddenReq(account_id=self.account, usernames=[]))['space_reclaimed'])
+        self.assertFalse(self.archive.config()['space_reclaim_pending'])

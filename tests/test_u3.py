@@ -237,6 +237,8 @@ class LifecycleTests(unittest.TestCase):
         self.manager.retry_task_cleanup(task['id'], self.account['id'])
         self.assertFalse(self.manager.busy())
         self.assertFalse(generation.exists())
+        self.assertEqual(task['reason'], '')
+        self.assertEqual(task['stage'], '资源清理完成')
 
     @unittest.skipUnless(os.name == 'nt', 'Windows synthetic CNG encryption')
     def test_snapshot_and_decrypt_cancel_remove_only_new_generation(self):

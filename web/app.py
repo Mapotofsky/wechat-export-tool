@@ -149,9 +149,7 @@ def validate_range(start, end):
 @app.get('/api/data-status')
 def data_status():
     status = manager.status()
-    rows = manager.archive().contacts() if manager.account() else []
-    status['setup']['has_readable_archive'] = bool(rows)
-    return dict(status, has_data=bool(rows), contacts=len(rows))
+    return dict(status, has_data=status['setup']['has_readable_archive'])
 
 
 @app.post('/api/check-directory')
@@ -232,6 +230,9 @@ def task_preview(req: TaskReq):
             if req.action != 'transcribe':
                 raise ValueError('仅语音转写支持消息选择')
             manager.archive().voice_targets(result['usernames'], [t.model_dump() for t in req.voice_targets])
+        if req.action == 'transcribe':
+            result['voices'] = manager.archive().voice_plan(result['usernames'],
+                None if req.voice_targets is None else [t.model_dump() for t in req.voice_targets])
         return result
 
 
@@ -255,6 +256,22 @@ class VoiceQuery(BaseModel):
 @app.post('/api/voices')
 def voices(req: VoiceQuery):
     return manager.archive().voice_page(list(dict.fromkeys(req.usernames)), req.status, req.q, req.offset)
+
+
+class VoiceSkipReq(BaseModel):
+    account_id: str
+    targets: list[VoiceTarget]
+    skipped: bool
+
+
+@app.post('/api/voice-skip')
+def voice_skip(req: VoiceSkipReq):
+    with manager.lock:
+        if not manager.account() or manager.account()['id'] != req.account_id:
+            raise ValueError('账号已切换，请刷新后重选语音')
+        if manager.busy():
+            raise ValueError('请等待当前任务完成后修改语音标记')
+        return manager.archive().set_voice_skipped([t.model_dump() for t in req.targets], req.skipped)
 
 
 @app.post('/api/followed')

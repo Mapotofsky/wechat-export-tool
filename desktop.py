@@ -69,6 +69,7 @@ class NativeBridge:
         self._closing = False
         self._manager = manager
         self._exit_waiting = False
+        self._save_stage = ''
 
     def choose_directory(self):
         import webview
@@ -82,6 +83,7 @@ class NativeBridge:
             if self._saving or self._closing:
                 return {'saved': False, 'error': '正在保存导出文件或退出'}
             self._saving = True
+            self._save_stage = '正在生成导出文件'
         try:
             export_format = request.get('format', 'zip')
             extension = export_format if export_format in ('txt', 'json') else 'zip'
@@ -96,10 +98,12 @@ class NativeBridge:
             filename = '微信聊天记录.' + extension
             if "filename*=UTF-8''" in disposition:
                 filename = unquote(disposition.split("filename*=UTF-8''", 1)[1].split(';', 1)[0])
+            self._save_stage = '等待选择保存位置'
             selected = self._window.create_file_dialog(webview.FileDialog.SAVE, save_filename=Path(filename).name)
             if not selected:
                 return {'saved': False}
             path = Path(selected[0] if isinstance(selected, (tuple, list)) else selected)
+            self._save_stage = '正在写入导出文件'
             path.write_bytes(content)
             self._last_saved = path.resolve()
             return {'saved': True, 'path': str(self._last_saved)}
@@ -114,6 +118,36 @@ class NativeBridge:
         finally:
             with self._state_lock:
                 self._saving = False
+                self._save_stage = ''
+
+    def native_state(self):
+        with self._state_lock:
+            return {'saving': self._saving, 'save_stage': self._save_stage, 'exit_waiting': self._exit_waiting}
+
+    def exit_action(self, action):
+        if action == 'minimize':
+            return self.minimize()
+        if action != 'stop':
+            return False
+        with self._state_lock:
+            if self._saving or not self._manager or getattr(self._manager, 'cleanup', None) or self._exit_waiting:
+                return False
+            with self._manager.lock:
+                task = self._manager.task
+                if task:
+                    self._manager.cancel(task['id'], task['account_id'])
+            self._exit_waiting = True
+        def wait_and_close():
+            while True:
+                with self._state_lock:
+                    if not self._busy() and not self._saving:
+                        self._closing = True
+                        self._exit_waiting = False
+                        break
+                time.sleep(.1)
+            self._window.destroy()
+        threading.Thread(target=wait_and_close, daemon=True).start()
+        return True
 
     def open_path(self, path):
         target = Path(path).resolve()
@@ -134,31 +168,11 @@ class NativeBridge:
             return self._can_close_locked()
 
     def _can_close_locked(self):
-        if self._saving or not self._manager or getattr(self._manager, 'cleanup', None):
-            if not (self._busy() or self._saving):
-                self._closing = True
-                return True
-            self._window.create_confirmation_dialog('任务仍在运行', '请等待任务完成后退出；可以最小化窗口继续处理。')
-            return False
-        if self._busy():
-            if self._exit_waiting:
-                return False
-            if self._window.create_confirmation_dialog('任务仍在运行', '选择“确定”停止任务后退出；选择“取消”继续等待，可最小化窗口。提交中的任务将等待实际结果。'):
-                with self._manager.lock:
-                    task = self._manager.task
-                    if task:
-                        self._manager.cancel(task['id'], task['account_id'])
-                self._exit_waiting = True
-                def wait_and_close():
-                    while True:
-                        with self._state_lock:
-                            if not self._busy() and not self._saving:
-                                self._closing = True
-                                self._exit_waiting = False
-                                break
-                        time.sleep(.1)
-                    self._window.destroy()
-                threading.Thread(target=wait_and_close, daemon=True).start()
+        if self._busy() or self._saving:
+            # Closing is called on the native UI thread. JS evaluation waits for
+            # that thread, so dispatch only after returning from the callback.
+            threading.Thread(target=self._window.evaluate_js,
+                args=("window.dispatchEvent(new Event('archive-close-request'))",), daemon=True).start()
             return False
         self._closing = True
         return True

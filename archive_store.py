@@ -41,6 +41,9 @@ class Archive:
                     username TEXT NOT NULL,message_key TEXT NOT NULL,input BLOB,
                     status TEXT NOT NULL,text TEXT NOT NULL,reason TEXT NOT NULL,source TEXT,
                     PRIMARY KEY(username,message_key));
+                CREATE TABLE IF NOT EXISTS voice_skips(
+                    username TEXT NOT NULL,message_key TEXT NOT NULL,
+                    PRIMARY KEY(username,message_key));
                 CREATE TABLE IF NOT EXISTS locations(
                     username TEXT NOT NULL,shard TEXT NOT NULL,local_id INTEGER NOT NULL,
                     timestamp INTEGER NOT NULL,message_key TEXT NOT NULL,
@@ -157,9 +160,11 @@ class Archive:
             try:
                 c.execute('VACUUM')
                 reclaimed = c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0
-                return dict(space_reclaimed=reclaimed, warning='' if reclaimed else '档案已清理，空间回收未完成；请稍后重试空间回收。')
+                result = dict(space_reclaimed=reclaimed, warning='' if reclaimed else '档案已清理，空间回收未完成；请稍后重试空间回收。')
             except sqlite3.Error as exc:
-                return dict(space_reclaimed=False, warning=f'档案已清理，空间回收未完成：{exc}；可稍后重试空间回收。')
+                result = dict(space_reclaimed=False, warning=f'档案已清理，空间回收未完成：{exc}；可稍后重试空间回收。')
+        self.save_config({'space_reclaim_pending': not result['space_reclaimed']})
+        return result
 
     def set_hidden(self, usernames, hidden=True, purge=False, progress=None):
         config = self.config()
@@ -186,7 +191,7 @@ class Archive:
                     for index, u in enumerate(usernames):
                         if progress:
                             progress(f'正在清理会话 {index + 1} / {len(usernames)}（事务尚未提交）')
-                        for table in ('messages', 'transcripts', 'locations', 'current_sources', 'chats'):
+                        for table in ('messages', 'transcripts', 'voice_skips', 'locations', 'current_sources', 'chats'):
                             count = c.execute(f'DELETE FROM {table} WHERE username=?', (u,)).rowcount
                             if table == 'messages':
                                 deleted += count
@@ -226,7 +231,7 @@ class Archive:
                 return self.messages(username, c, limit, start, end, offset)
         result = []
         for key, data, status, text, reason, source in connection.execute('''
-            SELECT m.message_key,m.data,t.status,t.text,t.reason,t.source FROM messages m
+            SELECT m.message_key,m.data,CASE WHEN EXISTS(SELECT 1 FROM voice_skips s WHERE s.username=m.username AND s.message_key=m.message_key) THEN 'skipped' ELSE t.status END,t.text,t.reason,t.source FROM messages m
             LEFT JOIN transcripts t ON t.username=m.username AND t.message_key=m.message_key
             WHERE m.username=? AND (? IS NULL OR m.timestamp>=?) AND (? IS NULL OR m.timestamp<=?)
             ORDER BY m.timestamp DESC,json_extract(m.data,'$.sort_seq') DESC,
@@ -293,7 +298,7 @@ class Archive:
         daily = [{'day': d, 'count': n} for d, n in connection.execute(
             "SELECT date(m.timestamp,'unixepoch','localtime') AS day,count(*)" + source + ' GROUP BY day ORDER BY day', params)]
         total = sum(bucket['count'] for bucket in daily)
-        rows = connection.execute('SELECT m.message_key,m.data,t.status,t.text,t.reason,t.source' + source + '''
+        rows = connection.execute("SELECT m.message_key,m.data,CASE WHEN EXISTS(SELECT 1 FROM voice_skips s WHERE s.username=m.username AND s.message_key=m.message_key) THEN 'skipped' ELSE t.status END,t.text,t.reason,t.source" + source + '''
             ORDER BY m.timestamp DESC,json_extract(m.data,'$.sort_seq') DESC,
             json_extract(m.data,'$.local_id') DESC,m.message_key DESC''' +
             (' LIMIT ? OFFSET ?' if limit is not None else ''), params + ([limit, offset] if limit is not None else []))
@@ -666,8 +671,16 @@ class Archive:
                         if old_key in transcripts:
                             transcripts[key] = transcripts.pop(old_key)
                     else:
+                        c.execute('''INSERT OR IGNORE INTO transcripts
+                            SELECT username,?,input,status,text,reason,source FROM transcripts
+                            WHERE username=? AND message_key=? AND EXISTS(SELECT 1 FROM voice_skips s
+                                WHERE s.username=transcripts.username AND s.message_key=transcripts.message_key)''',
+                            (key, username, old_key))
                         c.execute('DELETE FROM messages WHERE username=? AND message_key=?', (username, old_key))
                         c.execute('DELETE FROM transcripts WHERE username=? AND message_key=?', (username, old_key))
+                    c.execute('INSERT OR IGNORE INTO voice_skips SELECT username,? FROM voice_skips WHERE username=? AND message_key=?', (key, username, old_key))
+                    c.execute('DELETE FROM voice_skips WHERE username=? AND message_key=?', (username, old_key))
+                    c.execute("DELETE FROM voice_skips WHERE username=? AND message_key=? AND EXISTS(SELECT 1 FROM transcripts t WHERE t.username=voice_skips.username AND t.message_key=voice_skips.message_key AND t.status='success')", (username, key))
                     c.execute('UPDATE locations SET message_key=? WHERE username=? AND message_key=?', (key, username, old_key))
                     c.execute('UPDATE current_sources SET message_key=? WHERE username=? AND message_key=?', (key, username, old_key))
                     before = c.total_changes
@@ -720,11 +733,15 @@ class Archive:
             message_writes.append((username, key, m['timestamp'], data, source_input))
             old_messages[key] = (data, source_input)
             if old and old[1] != source_input and ((m['type'] & 0xffffffff) != 34 or media is None):
-                c.execute('DELETE FROM transcripts WHERE username=? AND message_key=?', (username, key))
+                c.execute('''DELETE FROM transcripts WHERE username=? AND message_key=?
+                    AND NOT EXISTS(SELECT 1 FROM voice_skips s WHERE s.username=transcripts.username
+                                   AND s.message_key=transcripts.message_key)''', (username, key))
         flush()
 
     def save_transcript(self, username, key, media, status, text='', reason='', source=None):
         with closing(self.connect()) as c, c:
+            if status == 'success':
+                c.execute('DELETE FROM voice_skips WHERE username=? AND message_key=?', (username, key))
             c.execute('INSERT OR REPLACE INTO transcripts VALUES (?,?,?,?,?,?,?)',
                       (username, key, media, status, text, reason, json.dumps(source, ensure_ascii=False)))
             row = c.execute('SELECT data FROM chats WHERE username=?', (username,)).fetchone()
@@ -739,6 +756,44 @@ class Archive:
     def record_transcript_error(self, username, key, reason):
         with closing(self.connect()) as c, c:
             c.execute('UPDATE transcripts SET reason=? WHERE username=? AND message_key=?', (reason, username, key))
+
+    def skipped_voices(self):
+        with closing(self.connect()) as c:
+            return set(c.execute('SELECT username,message_key FROM voice_skips'))
+
+    def set_voice_skipped(self, targets, skipped):
+        targets = [dict(username=u, message_id=k) for u, k in
+                   dict.fromkeys((t['username'], t['message_id']) for t in targets)]
+        users = list(dict.fromkeys(t['username'] for t in targets))
+        self.voice_targets(users, targets)
+        with closing(self.connect()) as c, c:
+            # Validate the whole batch before writing; successful text is never replaced.
+            if skipped:
+                for t in targets:
+                    row = c.execute('SELECT status FROM transcripts WHERE username=? AND message_key=?',
+                                    (t['username'], t['message_id'])).fetchone()
+                    if not row or row[0] not in ('failed', 'media_missing', 'tool_unavailable'):
+                        raise ValueError('仅失败、媒体缺失或工具不可用的语音可标记无需转写；成功结果保留')
+            for t in targets:
+                values = (t['username'], t['message_id'])
+                c.execute('INSERT OR IGNORE INTO voice_skips VALUES (?,?)' if skipped else
+                          'DELETE FROM voice_skips WHERE username=? AND message_key=?', values)
+        return {'saved': True, 'count': len(targets)}
+
+    def voice_plan(self, usernames, targets=None):
+        selected = self.voice_targets(usernames, targets)
+        skipped = self.skipped_voices()
+        counts = dict(total=len(selected), skipped=0, reusable=0, pending=0)
+        with closing(self.connect()) as c:
+            successful = set(c.execute("SELECT username,message_key FROM transcripts WHERE status='success' AND username IN (SELECT value FROM json_each(?))", (json.dumps(usernames),)))
+            for u, m in selected:
+                if (u, m['message_id']) in skipped:
+                    counts['skipped'] += 1
+                elif targets is None and (u, m['message_id']) in successful:
+                    counts['reusable'] += 1
+                else:
+                    counts['pending'] += 1
+        return counts
 
     def voice_targets(self, usernames, targets=None):
         self.require_visible(usernames)
@@ -759,23 +814,23 @@ class Archive:
         self.require_visible(usernames)
         if offset < 0 or not 1 <= limit <= 100:
             raise ValueError('语音分页参数无效')
-        if status not in ('', 'success', 'not_requested', 'failed', 'media_missing', 'tool_unavailable'):
+        if status not in ('', 'success', 'not_requested', 'failed', 'media_missing', 'tool_unavailable', 'skipped'):
             raise ValueError('未知转写状态')
         if not usernames:
             return {'messages': [], 'total': 0}
         condition = f"m.username IN ({','.join('?' for _ in usernames)}) AND (json_extract(m.data,'$.type') & 4294967295)=34"
         params = list(usernames)
         if status:
-            condition += " AND coalesce(t.status,'not_requested')=?"
+            condition += " AND (CASE WHEN s.message_key IS NOT NULL THEN 'skipped' ELSE coalesce(t.status,'not_requested') END)=?"
             params.append(status)
         if q:
             condition += " AND (instr(lower(coalesce(t.text,'')),lower(?))>0 OR instr(lower(coalesce(json_extract(m.data,'$.sender'),'')),lower(?))>0)"
             params.extend([q, q])
-        sql = ' FROM messages m LEFT JOIN transcripts t ON t.username=m.username AND t.message_key=m.message_key WHERE ' + condition
+        sql = ' FROM messages m LEFT JOIN transcripts t ON t.username=m.username AND t.message_key=m.message_key LEFT JOIN voice_skips s ON s.username=m.username AND s.message_key=m.message_key WHERE ' + condition
         with closing(self.connect()) as c:
             c.execute('BEGIN')
             total = c.execute('SELECT count(*)' + sql, params).fetchone()[0]
-            rows = c.execute('SELECT m.username,m.message_key,m.data,t.status,t.text,t.reason,t.source' + sql +
+            rows = c.execute("SELECT m.username,m.message_key,m.data,CASE WHEN s.message_key IS NOT NULL THEN 'skipped' ELSE t.status END,t.text,t.reason,t.source" + sql +
                              ' ORDER BY m.timestamp DESC,m.username,m.message_key DESC LIMIT ? OFFSET ?', params + [limit, offset])
             messages = [dict(we.normalize_system_sender(json.loads(data)), username=u, message_id=key,
                         transcription={'status': state or 'not_requested', 'text': text or '', 'reason': reason or '',

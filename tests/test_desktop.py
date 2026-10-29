@@ -16,6 +16,19 @@ import runtime_paths
 
 
 class DesktopTests(unittest.TestCase):
+    def test_close_callback_does_not_wait_for_javascript(self):
+        entered, release = threading.Event(), threading.Event()
+        def evaluate(*args):
+            entered.set()
+            release.wait(2)
+        bridge = desktop.NativeBridge('', lambda: True)
+        bridge._window = SimpleNamespace(evaluate_js=evaluate)
+        try:
+            self.assertFalse(bridge._can_close())
+            self.assertTrue(entered.wait(1))
+        finally:
+            release.set()
+
     def test_portable_paths_do_not_depend_on_current_directory(self):
         with tempfile.TemporaryDirectory(prefix='中文 portable ') as tmp:
             root = Path(tmp)
@@ -61,7 +74,7 @@ class DesktopTests(unittest.TestCase):
 
     def test_busy_or_saving_blocks_window_close(self):
         bridge = desktop.NativeBridge('', lambda: True)
-        bridge._window = SimpleNamespace(create_confirmation_dialog=lambda *args: True)
+        bridge._window = SimpleNamespace(evaluate_js=lambda *args: None)
         self.assertFalse(bridge._can_close())
         bridge._busy = lambda: False
         bridge._saving = True
@@ -73,11 +86,13 @@ class DesktopTests(unittest.TestCase):
         busy = threading.Event()
         busy.set()
         stopped, closed = threading.Event(), threading.Event()
-        manager = SimpleNamespace(lock=threading.RLock(), task={'id':'task', 'account_id':'account'}, cleanup=None,
+        manager = SimpleNamespace(lock=threading.RLock(), task={'id':'task', 'account_id':'account'},
                                   cancel=lambda *args: stopped.set())
         bridge = desktop.NativeBridge('', busy.is_set, manager)
-        bridge._window = SimpleNamespace(create_confirmation_dialog=lambda *args: True, destroy=closed.set)
+        bridge._window = SimpleNamespace(evaluate_js=lambda *args: None, destroy=closed.set)
         self.assertFalse(bridge._can_close())
+        self.assertFalse(stopped.is_set())
+        self.assertTrue(bridge.exit_action('stop'))
         self.assertTrue(stopped.is_set())
         self.assertFalse(closed.is_set())
         bridge._saving = True
@@ -91,8 +106,9 @@ class DesktopTests(unittest.TestCase):
         manager = SimpleNamespace(lock=threading.RLock(), task={'id':'task', 'account_id':'account'}, cleanup=None,
                                   cancel=lambda *args: self.fail('unexpected cancellation'))
         bridge = desktop.NativeBridge('', lambda: True, manager)
-        bridge._window = SimpleNamespace(create_confirmation_dialog=lambda *args: False)
+        bridge._window = SimpleNamespace(evaluate_js=lambda *args: None)
         self.assertFalse(bridge._can_close())
+        self.assertFalse(bridge.exit_action('wait'))
 
     def test_running_export_save_blocks_close_until_bytes_written(self):
         with tempfile.TemporaryDirectory(prefix='U3 合成导出 ') as tmp:
@@ -107,7 +123,7 @@ class DesktopTests(unittest.TestCase):
             self_test = self
             bridge = desktop.NativeBridge('http://127.0.0.1:1234', lambda: False)
             bridge._window = SimpleNamespace(create_file_dialog=lambda *args, **kwargs: (str(target),),
-                                              create_confirmation_dialog=lambda *args: True)
+                                              evaluate_js=lambda *args: None)
             results = []
             with patch.dict(sys.modules, {'webview': SimpleNamespace(FileDialog=SimpleNamespace(SAVE=1))}), patch.object(
                     desktop.urllib.request, 'urlopen', return_value=Response(b'synthetic')):
