@@ -43,7 +43,7 @@ def process_failure(result):
 
 def probe(python=PYTHON, *, online=False, cancellation=None):
     if not Path(python).is_file():
-        return {'available': False, 'python': str(python), 'reason': '未包含语音组件。请解压完整语音包（voice-runtime、tools 和 models）到程序目录；开发环境可设置 WECHAT_ARCHIVE_VOICE_PYTHON。', 'models': []}
+        return {'available': False, 'python': str(python), 'reason': '未找到语音运行时，请使用完整语音包补齐语音组件。', 'missing': ['语音运行时'], 'models': []}
     try:
         result = run_worker(python, '--probe', *(['--decoder-only'] if online else []), timeout=60, **({'cancellation': cancellation} if cancellation else {}))
         if result.returncode or not result.stdout:
@@ -53,8 +53,12 @@ def probe(python=PYTHON, *, online=False, cancellation=None):
             info['available'] = info.get('decoder_available', False)
         info['python'] = str(python)
         if not info['available']:
-            info['reason'] = ('在线识别需要本地 FFmpeg 音频转换工具及微信 SILK 解码包 pilk；请安装语音组件。' if online else
-                              f'请在 "{python}" 中安装 requirements-voice.txt，并预先准备本地 .pt 模型与 ffmpeg；可运行 "{python}" local_asr.py --probe 检查')
+            info['missing'] = [label for missing, label in [
+                (not online and not info.get('whisper'), 'Whisper 识别组件'),
+                (not online and not info.get('models'), '本地语音模型'),
+                (not info.get('ffmpeg'), 'FFmpeg 音频转换组件'),
+                (not info.get('silk'), 'SILK 微信语音解码组件')] if missing]
+            info['reason'] = '缺少识别所需的组件，请补齐后重新检查。'
         elif not info['silk']:
             info['reason'] = 'Whisper 可用；微信 SILK 语音仍需 pilk 解码包'
         return info

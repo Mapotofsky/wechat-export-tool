@@ -27,9 +27,9 @@ def normalize_aliases(groups):
         if len({t.lower() for t in members}) != len(members):
             raise ValueError('同一别名组的表达忽略英文大小写后不能重复')
         if not key or not name or not members:
-            raise ValueError('别名组需要稳定编号、组名和至少一个表达')
+            raise ValueError('别名组信息不完整，请重新添加组名和至少一个表达')
         if key in ids or name.lower() in names:
-            raise ValueError('别名组编号和名称不能重复')
+            raise ValueError('别名组重复，请使用不同的组名；仍失败时请刷新后重试')
         ids.add(key); names.add(name.lower())
         if group.get('enabled', True):
             for term in members:

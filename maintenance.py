@@ -39,16 +39,16 @@ def extraction_feedback(diagnostic, returncode, output_exists):
     if diagnostic.get('open_errors') and not diagnostic.get('opened_processes') and 5 in diagnostic['open_errors']:
         return 'access_denied', '系统拒绝读取微信进程，可尝试以管理员身份启动本工具后重试'
     if total and 0 < verified < total and output_exists and not returncode:
-        return 'partial', f'仅验证通过 {verified}/{total} 个数据库；已保存可用密钥，可尝试准备通讯录，或核对目录后重试提取'
+        return 'partial', f'已为 {verified}/{total} 个数据库验证并保存密钥；可继续准备通讯录，缺少所需密钥时再核对目录并重试'
     if total and verified == total and output_exists and not returncode:
         return 'complete', f'验证通过 {verified}/{total} 个数据库；请继续准备通讯录'
     if diagnostic.get('processes') == 0:
         return 'not_running', '未发现运行中的微信，请登录对应账号后重试'
     if diagnostic.get('candidate_count'):
-        return 'validation_failed', '发现候选但未通过校验；请核对当前登录账号的存储目录，确认数据库来自该目录后重试。现有证据不能确定是账号或权限问题'
+        return 'validation_failed', '未取得可用密钥。请核对当前登录账号的存储目录，再重试'
     if diagnostic.get('opened_processes'):
-        return 'no_candidates', '未取得可校验候选；请核对当前微信账号和存储目录，查看扫描覆盖及读取失败计数后重试'
-    return 'unknown', '工具未能完成诊断，未取得可用密钥；请确认微信已登录，核对当前账号存储目录后重试'
+        return 'no_candidates', '暂未提取到密钥，请核对当前微信账号和存储目录后重试；仍失败时可复制诊断排查'
+    return 'unknown', '未取得可用密钥。请确认微信已登录，核对当前账号的存储目录后重试'
 
 
 def atomic_json(path, data):
@@ -131,7 +131,7 @@ class Manager:
                                 next_step='重新执行对应操作', finished=now())
                     atomic_json(task_file, task)
                 if task.get('cleanup_resources') and account['id'] == self.registry.get('active'):
-                    self.cleanup = {'stage': '任务资源清理未完成，请重试', 'type': 'task_resources',
+                    self.cleanup = {'stage': '临时文件尚未清理完，请重试', 'type': 'task_resources',
                                     'task_id': task.get('id'), 'account_id': account['id']}
 
     def account(self):
@@ -171,10 +171,10 @@ class Manager:
         with self.lock:
             self.require_account(account_id)
             if not getattr(self, 'cleanup', None) or self.cleanup.get('type') != 'task_resources' or self.cleanup.get('task_id') != task_id:
-                raise ValueError('没有需要重试的任务资源清理')
+                raise ValueError('没有需要重新清理的临时文件')
             path = self.archive().directory / 'task.json'
             task = self.task if self.task and self.task.get('id') == task_id else json.loads(path.read_text(encoding='utf-8'))
-            self.cleanup['stage'] = '正在重试任务资源清理'
+            self.cleanup['stage'] = '正在重新清理临时文件'
             try:
                 for resource in task['cleanup_resources']:
                     target = Path(resource['path'])
@@ -184,12 +184,12 @@ class Manager:
                     else:
                         target.unlink(missing_ok=True)
             except OSError as exc:
-                self.cleanup['stage'] = f'任务资源清理未完成：{exc}；请重试'
+                self.cleanup['stage'] = f'临时文件尚未清理完：{exc}；请重试'
                 raise
             task.pop('cleanup_resources', None)
-            if task.get('reason', '').startswith('任务资源清理失败'):
+            if task.get('reason', '').startswith(('临时文件清理失败', '任务资源清理失败')):
                 task.update(reason='', stage='资源清理完成')
-            task.update(next_step='资源清理完成，可按原范围重新执行任务')
+            task.update(next_step='临时文件已清理，可以重试此任务或退出')
             atomic_json(path, task)
             self.cleanup = None
             return dict(task)
@@ -546,7 +546,7 @@ class Manager:
                     final_stage = '转写结束，存在失败语音'
                     task.update(stage='正在清理任务资源', result=result,
                                 reason=f"{result['failed']} 条语音转写失败，具体原因见下方汇总",
-                                next_step='按错误汇总修复工具后重试；成功的转写会自动复用')
+                                next_step='按错误汇总修复工具后重试；已有成功转写会保留，不会丢失')
                 else:
                     outcome = 'success'
                     final_stage = '部分密钥已保存' if task.get('diagnostic_code') == 'partial' else '完成'
@@ -555,7 +555,7 @@ class Manager:
             with self.lock:
                 outcome = 'cancelled'
                 task.update(stage='正在清理任务资源', cancellable=False,
-                            next_step='可按原范围重新执行；已发布结果保留')
+                            next_step='已保存的结果保留，可以重试此任务')
                 if hasattr(exc, 'result'):
                     task.update(result=exc.result, publication='逐条发布')
         except BaseException as exc:
@@ -568,10 +568,10 @@ class Manager:
                     task.update(diagnostic_code='keys_invalid', next_step='返回数据设置，重新提取或选择密钥文件，再准备通讯录；旧档案仍可阅读')
                 if (isinstance(exc, OSError) and (exc.errno == errno.ENOSPC or getattr(exc, 'winerror', None) == 112)) or (
                         isinstance(exc, sqlite3.Error) and (getattr(exc, 'sqlite_errorcode', None) == 13 or str(exc) == 'database or disk is full')):
-                    task.update(diagnostic_code='disk_full', next_step=f'数据或临时文件所在卷空间已耗尽。请释放空间后按原范围重试；未提交档案与配置保持原值，已发布结果保留。数据目录：{archive.directory}')
+                    task.update(diagnostic_code='disk_full', next_step=f'数据或临时文件所在卷空间已耗尽。请释放空间后重试此任务；未保存的改动不会生效，已有聊天记录和转写保留。数据目录：{archive.directory}')
                 # Avoid printing raw SQL values or subprocess output.
                 if isinstance(exc, CleanupError):
-                    reason = f'任务资源清理失败：{exc}；请重试任务资源清理'
+                    reason = f'临时文件清理失败：{exc}；请重试清理临时文件'
                 elif isinstance(exc, OSError):
                     filename = Path(exc.filename2 or exc.filename).name if (exc.filename2 or exc.filename) else '未知文件'
                     code = getattr(exc, 'winerror', None) or exc.errno
@@ -581,7 +581,7 @@ class Manager:
                 frame = traceback.extract_tb(exc.__traceback__)[-1]
                 task.update(failed_stage=task['stage'], reason=reason,
                             error_location=f'{Path(frame.filename).name}:{frame.lineno} · {frame.name}',
-                            next_step=task.get('next_step') or '按失败原因调整目录、身份或工具后重新执行；此前可用档案仍保留')
+                            next_step=task.get('next_step') or '按上方原因处理后重试此任务；原有聊天记录保留')
         finally:
             try:
                 config = archive.config()
@@ -591,7 +591,7 @@ class Manager:
                     keys.unlink(missing_ok=True)
             except OSError as exc:
                 outcome = 'failed'
-                task.update(reason=f'任务资源清理失败：{exc}', next_step='检查数据目录访问权限后重试；已发布结果保留')
+                task.update(reason=f'临时文件清理失败：{exc}', next_step='检查数据目录权限后重试清理临时文件；已保存的结果保留')
                 if generation and Path(generation).exists():
                     task.setdefault('cleanup_resources', []).append({'path': str(generation), 'directory': True})
                 if keys and keys.exists() and str(keys) != config.get('keys_file'):
@@ -604,7 +604,7 @@ class Manager:
                 elif final_stage:
                     task['stage'] = final_stage
                 if task.get('cleanup_resources'):
-                    self.cleanup = {'stage': '任务资源清理未完成，请重试', 'type': 'task_resources',
+                    self.cleanup = {'stage': '临时文件尚未清理完，请重试', 'type': 'task_resources',
                                     'task_id': task.get('id'), 'account_id': task.get('account_id')}
                 try:
                     atomic_json(task_path, task)

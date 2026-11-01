@@ -233,7 +233,7 @@ class LifecycleTests(unittest.TestCase):
         with patch('maintenance.shutil.rmtree', side_effect=PermissionError('synthetic retry failure')):
             with self.assertRaises(PermissionError):
                 self.manager.retry_task_cleanup(task['id'], self.account['id'])
-        self.assertIn('未完成', self.manager.cleanup['stage'])
+        self.assertIn('未清理完', self.manager.cleanup['stage'])
         self.manager.retry_task_cleanup(task['id'], self.account['id'])
         self.assertFalse(self.manager.busy())
         self.assertFalse(generation.exists())

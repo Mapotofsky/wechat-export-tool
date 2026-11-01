@@ -25,7 +25,8 @@ class LauncherTests(unittest.TestCase):
             run.return_value.returncode = 0
             info = voice_service.probe(path)
         self.assertEqual(run.call_args.args[0][0], path)
-        self.assertIn(path, info['reason'])
+        self.assertEqual(path, info['python'])
+        self.assertTrue(info['missing'])
 
     def test_probe_unicode_paths_with_legacy_windows_encoding(self):
         with tempfile.TemporaryDirectory(prefix='语音 工具 ') as tmp:

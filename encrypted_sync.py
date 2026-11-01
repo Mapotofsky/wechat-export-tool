@@ -115,9 +115,9 @@ def materialize(source, target, key, progress=lambda *args: None):
         try:
             valid = all(row[0] == 'ok' for row in c.execute('PRAGMA quick_check'))
         except sqlite3.Error as exc:
-            raise RuntimeError(f'{target.name} 一致性检查无法执行（{exc}）；未发布本次数据') from exc
+            raise RuntimeError(f'{target.name} 一致性检查无法执行（{exc}）；本次数据未保存') from exc
         if not valid:
-            raise ValueError(f'{target.name} 解密/WAL 合并后 SQLite 一致性检查失败，未发布本次数据')
+            raise ValueError(f'{target.name} 解密/WAL 合并后 SQLite 一致性检查失败，本次数据未保存')
     return {'committed_frames': len(frames), 'wal_present': Path(str(source) + '-wal').exists(),
             'real_wechat_validation': 'not_performed'}
 
@@ -201,7 +201,7 @@ def stable_files(paths):
                     release()
                     if lock_error.errno not in (32, 33) or attempt == 19:
                         if lock_error.errno in (32, 33):
-                            raise RuntimeError(f'数据库正在写入或 checkpoint（Windows 错误 {lock_error.errno}）。请稍后点击重试；持续占用时再退出微信。') from lock_error
+                            raise RuntimeError(f'微信正在写入数据库（Windows 错误 {lock_error.errno}）。请稍后点击重试；持续占用时再退出微信。') from lock_error
                         raise RuntimeError(f'无法读取或锁定快照文件（Windows 错误 {lock_error.errno}）；请检查访问权限与目录是否发生变化') from lock_error
                     time.sleep(.05)
         yield
@@ -277,7 +277,7 @@ def _sync(source, account_dir, keys_file, previous, progress, contacts_only, med
     snapshot_seconds = time.perf_counter() - snapshot_started
     for index, db in enumerate(files):
         file_started = time.perf_counter()
-        progress('解密与 WAL 合并（真实验证待执行）', index, len(files))
+        progress('解密与 WAL 合并', index, len(files))
         rel = db.relative_to(source)
         src, dst = snapshot / rel, generation / rel
         wal = Path(str(src) + '-wal')

@@ -184,13 +184,13 @@ class Archive:
             values['view_state'] = {}
         deleted = 0
         if progress:
-            progress('正在提交档案清理' if purge else '正在保存隐藏状态')
+            progress('正在删除所选聊天记录' if purge else '正在保存隐藏状态')
         with closing(self.connect()) as c:
             with c:
                 if hidden and purge:
                     for index, u in enumerate(usernames):
                         if progress:
-                            progress(f'正在清理会话 {index + 1} / {len(usernames)}（事务尚未提交）')
+                            progress(f'正在清理会话 {index + 1} / {len(usernames)}（完成后保存）')
                         for table in ('messages', 'transcripts', 'voice_skips', 'locations', 'current_sources', 'chats'):
                             count = c.execute(f'DELETE FROM {table} WHERE username=?', (u,)).rowcount
                             if table == 'messages':
@@ -572,7 +572,7 @@ class Archive:
                 final_signatures = {k: v['signature'] for k, v in self._source_signatures(db_dir, include_media, progress).items()}
                 metrics['signature_seconds'] += time.perf_counter() - phase
                 if final_signatures != signatures:
-                    raise RuntimeError('明文源库在导入期间发生变化，未发布本次导入；请稳定源库后重试')
+                    raise RuntimeError('源文件在导入期间发生变化，本次导入未保存。请稍后重试；持续出现时先退出微信')
             baseline = {'signatures': signatures, 'context': context,
                         'identities': {name: list(state[3]) for name, state in reader.shards.items()}}
             if selected is None:
@@ -695,7 +695,7 @@ class Archive:
             source_input = json.dumps([encoded(raw), m['type'], m.get('status')], ensure_ascii=False)
             if key in seen:
                 if seen[key] != source_input:
-                    raise RuntimeError('同一会话 server_id 在多个分片中存在冲突内容，未发布本次导入')
+                    raise RuntimeError('多个源文件中同一消息的内容不一致，本次导入未保存。请核对源目录后重试')
                 # A skipped shard may own the earlier canonical row. Preserve that winner.
                 old = old_messages.get(key)
                 canonical = json.loads(old[0]) if old else None

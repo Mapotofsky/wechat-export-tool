@@ -63,11 +63,11 @@ def capacity(preparation, archive):
                 names.append(str(wal))
         except OSError as exc:
             unknown.append(f'{db}：{exc}')
-    targets = [(archive.directory, copied, copied + output, '数据与新快照')]
+    targets = [(archive.directory, copied, copied + output, '聊天记录与数据副本')]
     if preparation['media'] and preparation.get('transcribe'):
         targets.append((Path(tempfile.gettempdir()), 0, None, '语音临时文件'))
     if preparation.get('sqlite_temp'):
-        targets.append((sqlite_temp_root(), 0, None, 'SQLite 导入临时表'))
+        targets.append((sqlite_temp_root(), 0, None, '导入时的临时文件'))
     rows = {}
     for path, necessary, estimate, purpose in targets:
         key = volume(path)
@@ -87,11 +87,11 @@ def capacity(preparation, archive):
     volumes = list(rows.values())
     return dict(files=names, copy_bytes=copied, retained_bytes=retained, volumes=volumes,
                 blocked=any(r['free_bytes'] is not None and r['necessary_bytes'] > r['free_bytes'] for r in volumes),
-                unknown=unknown + ['档案增长、SQLite WAL／临时写入、语音解码工作空间随运行变化；旧代次继续保留。',
-                                   '解密输出按数据库与 WAL 页估计；峰值展示快照和输出同时存在的保守估计。'])
+                unknown=unknown + ['尚未计入全部用量：聊天记录增长、数据库临时写入和语音转换。以前保留的数据副本不会自动删除。',
+                                   '解密文件按数据库及 WAL 页大小估算，并计入它们与源副本同时存在时的占用。'])
 
 
 def require_capacity(info):
     if info['blocked']:
         row = next(r for r in info['volumes'] if r['free_bytes'] is not None and r['necessary_bytes'] > r['free_bytes'])
-        raise ValueError(f"{row['volume']} 空间不足：必要复制 {row['necessary_bytes']} 字节，可用 {row['free_bytes']} 字节。请释放该卷空间，或退出后用 WECHAT_ARCHIVE_DATA_DIR 指定已有数据所在的可写位置再重试。")
+        raise ValueError(f"{row['volume']} 空间不足：仅数据复制就需要 {row['necessary_bytes']} 字节，可用 {row['free_bytes']} 字节。请释放该磁盘空间后重试。数据目录可在设置中查看；如需更换位置，请先退出并保留原数据。")

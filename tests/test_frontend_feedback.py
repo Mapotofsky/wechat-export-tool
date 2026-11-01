@@ -6,16 +6,37 @@ import sqlite3
 import threading
 import time
 import unittest
+import json
 from unittest.mock import patch
 
 import test_u3
 from test_maintenance import table
 import voice_service
+from maintenance import Manager, atomic_json
+from web import app as web
 
 
 class FeedbackTests(unittest.TestCase):
     setUp = test_u3.LifecycleTests.setUp
     wait = test_u3.LifecycleTests.wait
+
+    def test_internal_http_and_saved_stages_remain_equal(self):
+        task = dict(id='synthetic-raw-stage', account_id=self.account['id'], action='update',
+                    status='failed', stage='提交消息档案', failed_stage='提取与语音转写',
+                    done=1, total=3, unit='个会话', cancellable=False)
+        self.manager.task = task
+        path = self.archive.directory / 'task.json'
+        atomic_json(path, task)
+        with patch.object(web, 'manager', self.manager):
+            returned = web.data_status()['task']
+        saved = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual(returned, task)
+        self.assertEqual(saved, task)
+        restarted = Manager(self.manager.root)
+        self.addCleanup(restarted.executor.shutdown)
+        self.assertEqual(restarted.status()['task'], task)
+        self.assertEqual((returned['done'], returned['total'], returned['unit'], returned['cancellable']),
+                         (1, 3, '个会话', False))
     def test_online_activity_preserves_batch_count_and_original_scope(self):
         with closing(sqlite3.connect(self.source / 'message/message_0.db')) as c, c:
             c.execute(f'UPDATE "{table(self.username)}" SET local_type=34')
