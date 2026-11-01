@@ -1,5 +1,6 @@
 """Assemble only declared program files; never copy a developer environment or data."""
 import argparse
+import datetime
 from importlib import metadata
 import json
 from pathlib import Path
@@ -20,7 +21,28 @@ PREREQUISITES = {
 }
 PROGRAM_FILES = ('archive_store.py', 'archive_analysis.py', 'analysis_lexicon.py', 'encrypted_sync.py', 'local_asr.py', 'maintenance.py',
     'voice_service.py', 'wcdb_key_tool_windows.py', 'wechat_export.py', 'run.py',
-    'runtime_paths.py', 'desktop.py', 'task_lifecycle.py', 'supervised_process.py')
+    'runtime_paths.py', 'desktop.py', 'task_lifecycle.py', 'supervised_process.py', 'preparation.py')
+
+
+def resource_version():
+    try:
+        revision = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], cwd=ROOT, text=True).strip()
+        if subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=ROOT, text=True).strip():
+            revision += ' + 工作区改动'
+    except (OSError, subprocess.CalledProcessError):
+        revision = None
+    return dict(resource_revision=revision, resources_updated_at=datetime.datetime.now().astimezone().isoformat(timespec='seconds'))
+
+
+def write_launchers(destination):
+    (destination / '启动微信聊天档案.cmd').write_text(
+        '@echo off\nchcp 65001 >nul\ncd /d "%~dp0"\n'
+        'if not exist "%~dp0runtime\\pythonw.exe" (\n'
+        '  echo 缺少 runtime\\pythonw.exe，请重新解压完整程序包，保留原有数据目录。\n  pause\n  exit /b 1\n)\n'
+        'start "" "%~dp0runtime\\pythonw.exe" "%~dp0app\\desktop.py" %*\n', encoding='utf-8')
+    (destination / '诊断启动.cmd').write_text(
+        '@echo off\nchcp 65001 >nul\ncd /d "%~dp0"\n'
+        '"%~dp0runtime\\python.exe" "%~dp0app\\desktop.py" %*\npause\n', encoding='utf-8')
 
 
 def run(*args):
@@ -138,10 +160,12 @@ def build(args):
                 old.unlink()
     shutil.copytree(static, app / 'web' / 'static', dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns('__pycache__', '*.map'))
+    write_launchers(destination)
     if args.resources_only:
         manifest_file = destination / 'release-manifest.json'
         manifest = json.loads(manifest_file.read_text(encoding='utf-8'))
         manifest['program_files'] = list(PROGRAM_FILES)
+        manifest.update(resource_version())
         manifest['packages']['base'] = collect_licenses(destination / 'runtime', destination / 'licenses' / 'base')
         if (destination / 'voice-runtime' / 'python.exe').is_file():
             manifest['packages']['voice'] = collect_licenses(destination / 'voice-runtime', destination / 'licenses' / 'voice')
@@ -212,16 +236,13 @@ def build(args):
         # imageio's bundled FFmpeg is distributed under GPL; preserve its notice.
         download('https://raw.githubusercontent.com/imageio/imageio-ffmpeg/main/LICENSE', licenses / 'imageio-ffmpeg-LICENSE.txt')
         download('https://www.gnu.org/licenses/gpl-3.0.txt', licenses / 'FFmpeg-GPL-3.0.txt')
-    (destination / '启动微信聊天档案.cmd').write_text(
-        '@echo off\r\ncd /d "%~dp0"\r\nstart "" "%~dp0runtime\\pythonw.exe" "%~dp0app\\desktop.py"\r\n', encoding='utf-8')
-    (destination / '诊断启动.cmd').write_text(
-        '@echo off\r\ncd /d "%~dp0"\r\n"%~dp0runtime\\python.exe" "%~dp0app\\desktop.py"\r\npause\r\n', encoding='utf-8')
     inventory = release_files(destination)
     manifest = {'python': PYTHON_VERSION, 'python_source': PYTHON_URL, 'flavor': 'voice-' + args.voice_device if args.voice else 'base',
                 'program_files': list(PROGRAM_FILES), 'packages': packages, 'files': inventory,
                 'prerequisites': {name: {'source': url, 'bytes': (prerequisites / name).stat().st_size,
                     'product_version': windows_file_version(prerequisites / name)}
                     for name, url in PREREQUISITES.items()} if args.prerequisites else {}}
+    manifest.update(resource_version())
     (destination / 'release-manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
     print(f'Built {destination}', flush=True)
 

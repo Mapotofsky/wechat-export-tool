@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import unquote
 
-from runtime_paths import data_root, logs_root, package_root, python_executable
+from runtime_paths import data_root, logs_root, package_root, python_executable, check_writable
 
 
 class InstanceLock:
@@ -32,6 +32,10 @@ class InstanceLock:
         self.file.seek(0)
         try:
             msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+            self.file.seek(1)
+            self.file.truncate()
+            self.file.write(json.dumps({'pid': os.getpid(), 'program': str(Path(__file__).resolve())}).encode('utf-8'))
+            self.file.flush()
             return True
         except OSError:
             self.file.close()
@@ -48,14 +52,14 @@ def wait_ready(url, thread, timeout=30):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not thread.is_alive():
-            raise RuntimeError('本机服务启动失败，请检查 local_data/logs/desktop.log')
+            raise RuntimeError(f'本机服务启动失败，请检查 {logs_root() / "desktop.log"}')
         try:
             with urllib.request.urlopen(url + '/api/data-status', timeout=1) as response:
                 if response.status == 200:
                     return
         except (OSError, urllib.error.URLError):
             time.sleep(.1)
-    raise RuntimeError('等待本机服务就绪超时，请检查 local_data/logs/desktop.log')
+    raise RuntimeError(f'等待本机服务就绪超时，请检查 {logs_root() / "desktop.log"}')
 
 
 class NativeBridge:
@@ -159,6 +163,16 @@ class NativeBridge:
         except OSError as exc:
             return {'opened': False, 'error': str(exc)}
 
+    def open_resource(self, kind):
+        targets = {'data': data_root(), 'logs': logs_root()}
+        if kind not in targets:
+            return {'opened': False, 'error': '未知资源目录'}
+        try:
+            os.startfile(str(targets[kind]))
+            return {'opened': True}
+        except OSError as exc:
+            return {'opened': False, 'error': f'{targets[kind]}：{exc}'}
+
     def minimize(self):
         self._window.minimize()
         return True
@@ -201,23 +215,63 @@ def check_webview2():
     raise RuntimeError('未检测到 Microsoft Edge WebView2 Runtime。请安装 prerequisites 中的离线安装程序后重试。')
 
 
+def activate_instance(path):
+    """Only enumerate windows owned by the process holding this data lock."""
+    try:
+        with Path(path).open('rb') as stream:
+            stream.seek(1)
+            owner = json.loads(stream.read().decode('utf-8'))
+    except (OSError, ValueError):
+        owner = {}
+    pid = owner.get('pid')
+    windows = []
+    if pid:
+        user32 = ctypes.windll.user32
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def visit(hwnd, _):
+            process = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(process))
+            if process.value == pid and user32.IsWindowVisible(ctypes.c_void_p(hwnd)):
+                windows.append(hwnd)
+            return True
+        user32.EnumWindows(visit, 0)
+        if windows:
+            handle = ctypes.c_void_p(windows[0])
+            user32.ShowWindow(handle, 9)
+            if user32.SetForegroundWindow(handle):
+                return True
+    ctypes.windll.user32.MessageBoxW(None,
+        f'此数据目录已有实例：{data_root()}\n所属进程 PID：{pid or "未取得"}\n程序：{owner.get("program", "未取得")}\n'
+        '未能激活窗口。若正在启动请稍候；持续无窗时，核对没有维护或导出任务后，可在任务管理器按此 PID 结束该宿主并重启。\n'
+        f'日志：{logs_root()}\n可使用包内“诊断启动.cmd”查看启动输出；锁文件存在本身无需删除。', '微信聊天档案', 0x40)
+    return False
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='微信聊天档案桌面工作台')
     parser.add_argument('--smoke-test', action='store_true', help='窗口就绪后自动关闭，仅用于发布验证')
     args = parser.parse_args(argv)
-    logs_root().mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(filename=logs_root() / 'desktop.log', level=logging.INFO,
-                        encoding='utf-8', format='%(asctime)s %(levelname)s %(message)s')
     lock = InstanceLock(data_root() / 'desktop.lock')
-    if not lock.acquire():
-        ctypes.windll.user32.MessageBoxW(None, '微信聊天档案已经运行，请切换到已有窗口。', '微信聊天档案', 0x40)
-        return 0
     server = None
     thread = None
+    stage, target = '初始化数据目录', data_root()
     try:
+        check_writable(target)
+        stage, target = '初始化日志目录', logs_root()
+        check_writable(target)
+        stage, target = '创建启动日志', logs_root() / 'desktop.log'
+        logging.basicConfig(filename=target, level=logging.INFO,
+                            encoding='utf-8', format='%(asctime)s %(levelname)s %(message)s')
+        stage, target = '获取实例锁', lock.path
+        if not lock.acquire():
+            activate_instance(lock.path)
+            return 0
+        stage, target = '加载桌面运行库', package_root()
         import webview
         import uvicorn
+        stage, target = '打开账号与档案', data_root()
         from web.app import app, manager
+        stage, target = '检查桌面运行库', package_root() / 'prerequisites'
         check_webview2()
         # Reserve a free loopback socket before starting the service.
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -226,10 +280,12 @@ def main(argv=None):
         server = uvicorn.Server(uvicorn.Config(app, host='127.0.0.1', port=port,
                                              log_config=None, access_log=False))
         thread = threading.Thread(target=server.run, kwargs={'sockets': [sock]}, daemon=True)
+        stage, target = '启动本机服务', logs_root() / 'desktop.log'
         thread.start()
         url = f'http://127.0.0.1:{port}'
         wait_ready(url, thread)
         bridge = NativeBridge(url, manager.busy, manager)
+        stage, target = '创建桌面窗口', package_root()
         window = webview.create_window('微信聊天档案', url, js_api=bridge, width=1366, height=860,
                                        min_size=(900, 600))
         bridge._window = window
@@ -251,7 +307,12 @@ def main(argv=None):
         return 0
     except Exception as exc:
         logging.exception('桌面启动失败')
-        ctypes.windll.user32.MessageBoxW(None, str(exc), '微信聊天档案启动失败', 0x10)
+        reason = f'系统错误 {getattr(exc, "winerror", None) or exc.errno}：{exc.strerror}' if isinstance(exc, OSError) else f'{type(exc).__name__}：{exc}'
+        recovery = ('请释放空间或设置 WECHAT_ARCHIVE_DATA_DIR 指向可写的已有数据目录，再重试。不要删除原数据目录。'
+                    if stage in ('初始化数据目录', '初始化日志目录', '创建启动日志', '获取实例锁', '打开账号与档案') else
+                    '按上述原因补齐 prerequisites 中的运行库；可用“诊断启动.cmd”查看输出后重试。')
+        ctypes.windll.user32.MessageBoxW(None,
+            f'{stage}\n位置：{target}\n{reason}\n\n{recovery}', '微信聊天档案启动失败', 0x10)
         return 1
     finally:
         if server:

@@ -2,6 +2,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
+import errno
+import sqlite3
 import logging
 from pathlib import Path
 import subprocess
@@ -10,6 +12,7 @@ import threading
 import time
 import traceback
 import uuid
+import preparation
 
 from archive_store import Archive, now
 import encrypted_sync
@@ -242,6 +245,21 @@ class Manager:
                 archive.prepare_directory(info['directory'])
             return account
 
+    def switch(self, account_id):
+        with self.lock:
+            if self.busy():
+                raise ValueError('维护或清理正在执行，完成后再切换账号')
+            account = next((a for a in self.registry['accounts'] if a['id'] == account_id), None)
+            if account is None:
+                raise ValueError('已保存账号不存在，请刷新后重试')
+            registry = dict(self.registry, active=account_id)
+            atomic_json(self.registry_path, registry)
+            self.registry = registry
+            return account
+
+    def preparation_preview(self, action, usernames, targets=None):
+        return preparation.capacity(preparation.plan(self.account(), self.archive(), action, usernames, targets), self.archive())
+
     def status(self):
         account = self.account()
         config, task = {}, None
@@ -294,11 +312,11 @@ class Manager:
             account = dict(self.account() or {})
             archive = self.archive(account)
             config = archive.config()
-            if action in ('extract', 'prepare', 'discover', 'update', 'update_all', 'transcribe'):
+            if action in ('extract', 'prepare', 'discover', 'update', 'update_all'):
                 inspect_directory(account['directory'])
             if action == 'extract' and account['mode'] != 'encrypted':
                 raise ValueError('明文库无需提取密钥')
-            if action != 'extract' and account['mode'] == 'encrypted' and not (
+            if action not in ('extract', 'transcribe') and account['mode'] == 'encrypted' and not (
                     config.get('keys_file') and Path(config['keys_file']).is_file()):
                 raise ValueError('请先提取密钥或保存有效的密钥文件路径')
             if action in ('update', 'update_all') and not config.get('self_username'):
@@ -328,6 +346,11 @@ class Manager:
                 if action != 'transcribe':
                     raise ValueError('仅语音转写支持消息选择')
                 archive.voice_targets(usernames, voice_targets)
+            if action == 'transcribe' and preparation.plan(account, archive, action, usernames, voice_targets)['media']:
+                inspect_directory(account['directory'])
+                if account['mode'] == 'encrypted' and not (config.get('keys_file') and Path(config['keys_file']).is_file()):
+                    raise ValueError('请先提取密钥或保存有效的密钥文件路径')
+            preparation.require_capacity(self.preparation_preview(action, usernames, voice_targets))
             task = {'id': uuid.uuid4().hex, 'account_id': account['id'], 'action': action,
                     'status': 'running', 'stage': '准备', 'done': 0, 'total': 0, 'started': now(),
                     'next_step': '', 'reason': '', 'selected_usernames': usernames, 'selected_count': len(usernames),
@@ -335,9 +358,9 @@ class Manager:
                     'cancel_boundary': '等待当前安全边界', 'publication': '未发布'}
             if voice_targets is not None:
                 task['voice_targets'] = voice_targets
+            atomic_json(archive.directory / 'task.json', task)
             self.task = task
             self.cancellation = Cancellation(self.lock)
-            atomic_json(archive.directory / 'task.json', task)
             self.executor.submit(self.perform, account, archive, task, action, usernames)
             return dict(task)
 
@@ -382,6 +405,8 @@ class Manager:
                 task['activity'] = message
         try:
             config = archive.config()
+            file_plan = preparation.plan(account, archive, action, usernames, task.get('voice_targets'))
+            preparation.require_capacity(preparation.capacity(file_plan, archive))
             manifest = {}
             if action == 'extract':
                 if account['mode'] != 'encrypted':
@@ -434,10 +459,7 @@ class Manager:
                 if account['mode'] == 'encrypted':
                     if not config.get('keys_file'):
                         raise ValueError('请先点击提取密钥，或设置已有的本账号密钥文件')
-                    with closing(archive.connect()) as c:
-                        media_needed = action in ('update', 'update_all') and bool(c.execute(
-                            "SELECT 1 FROM transcripts WHERE status='success' AND (? OR username IN (SELECT value FROM json_each(?))) LIMIT 1",
-                            (False, json.dumps(usernames))).fetchone())
+                    media_needed = file_plan['media']
                     db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
                                                           config['keys_file'], [db_dir, config.get('message_snapshot'), config.get('media_snapshot')], progress,
                                                           contacts_only=False, media=media_needed)
@@ -544,6 +566,9 @@ class Manager:
                 if isinstance(exc, encrypted_sync.KeyPreparationError):
                     archive.save_config({'keys_error': str(exc)})
                     task.update(diagnostic_code='keys_invalid', next_step='返回数据设置，重新提取或选择密钥文件，再准备通讯录；旧档案仍可阅读')
+                if (isinstance(exc, OSError) and (exc.errno == errno.ENOSPC or getattr(exc, 'winerror', None) == 112)) or (
+                        isinstance(exc, sqlite3.Error) and (getattr(exc, 'sqlite_errorcode', None) == 13 or str(exc) == 'database or disk is full')):
+                    task.update(diagnostic_code='disk_full', next_step=f'数据或临时文件所在卷空间已耗尽。请释放空间后按原范围重试；未提交档案与配置保持原值，已发布结果保留。数据目录：{archive.directory}')
                 # Avoid printing raw SQL values or subprocess output.
                 if isinstance(exc, CleanupError):
                     reason = f'任务资源清理失败：{exc}；请重试任务资源清理'
@@ -581,4 +606,7 @@ class Manager:
                 if task.get('cleanup_resources'):
                     self.cleanup = {'stage': '任务资源清理未完成，请重试', 'type': 'task_resources',
                                     'task_id': task.get('id'), 'account_id': task.get('account_id')}
-                atomic_json(task_path, task)
+                try:
+                    atomic_json(task_path, task)
+                except OSError:
+                    logging.getLogger(__name__).exception('任务结束状态无法写入 %s；当前进程仍保留结果', task_path)

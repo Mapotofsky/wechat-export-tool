@@ -222,6 +222,13 @@ class KeyPreparationError(ValueError):
     """The selected key file cannot prepare the requested databases."""
 
 
+def preparation_files(source, contacts_only=False, media=False):
+    source = Path(source)
+    return sorted([source / 'contact' / 'contact.db'] +
+                  ([] if contacts_only else [p for p in (source / 'message').glob('message_*.db') if is_message_shard(p.name)]) +
+                  (list((source / 'message').glob('media_*.db')) if media else []))
+
+
 def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: None, contacts_only=False, media=False):
     generation = Path(account_dir) / 'decrypted' / uuid.uuid4().hex
     generation.mkdir(parents=True)
@@ -244,9 +251,7 @@ def _sync(source, account_dir, keys_file, previous, progress, contacts_only, med
         keys = cipher._strip_key_metadata(raw_keys)
     except (ValueError, OSError):
         raise KeyPreparationError('密钥文件无法读取或不是有效 JSON，请重新选择密钥文件或提取密钥') from None
-    files = sorted([source / 'contact' / 'contact.db'] +
-                   ([] if contacts_only else [p for p in (source / 'message').glob('message_*.db') if is_message_shard(p.name)]) +
-                   (list((source / 'message').glob('media_*.db')) if media else []))
+    files = preparation_files(source, contacts_only, media)
     if not files or not files[0].exists() or not list((source / 'message').glob('message_*.db')):
         raise ValueError('目录需要包含 contact/contact.db 与 message/message_*.db')
     manifest, reusable = {}, []

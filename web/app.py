@@ -19,7 +19,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from maintenance import Manager, inspect_directory, identity_candidates
 import voice_service
 import wechat_export as we
-from runtime_paths import data_root
+from runtime_paths import data_root, runtime_summary
 import archive_analysis as analysis
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +56,20 @@ class DirectoryReq(BaseModel):
 class AccountReq(DirectoryReq):
     label: str
     confirmed: bool = False
+
+
+class SwitchReq(BaseModel):
+    account_id: str
+
+
+@app.post('/api/account-switch')
+def switch_account(req: SwitchReq):
+    return manager.switch(req.account_id)
+
+
+@app.get('/api/runtime-summary')
+def running_resources():
+    return runtime_summary()
 
 
 class IdentityReq(BaseModel):
@@ -232,6 +246,9 @@ def task_preview(req: TaskReq):
             manager.archive().voice_targets(result['usernames'], [t.model_dump() for t in req.voice_targets])
         if req.action == 'transcribe':
             result['voices'] = manager.archive().voice_plan(result['usernames'],
+                None if req.voice_targets is None else [t.model_dump() for t in req.voice_targets])
+        if req.action in ('prepare', 'discover', 'update', 'update_all', 'transcribe'):
+            result['capacity'] = manager.preparation_preview(req.action, result['usernames'],
                 None if req.voice_targets is None else [t.model_dump() for t in req.voice_targets])
         return result
 

@@ -1,4 +1,5 @@
 import React from 'react';
+import {useEffect,useState} from 'react';
 
 export type Task={id:string;account_id:string;action:string;status:string;stage:string;activity?:string;unit?:string;done:number;total:number;cancellable?:boolean;reason:string;next_step:string;selected_count:number;selected_usernames:string[];scope:string;voice_targets?:{username:string;message_id:string}[];diagnostic?:Record<string,unknown>;diagnostic_code?:string;failed_stage?:string;error_location?:string;result?:Record<string,any>};
 export const taskName=(action:string)=>({extract:'提取密钥',prepare:'准备通讯录',discover:'发现历史会话',update:'导入 / 更新档案',update_all:'更新全部档案',transcribe:'语音转写'} as Record<string,string>)[action]||'处理任务';
@@ -6,6 +7,9 @@ const states:Record<string,string>={running:'进行中',cancelling:'正在停止
 const fields:Record<string,[string,string][]>= {prepare:[['databases','已准备数据库'],['contacts','通讯录条目']],discover:[['contacts','通讯录条目']],update:[['added','新增消息'],['changed','更新消息'],['reused','复用记录']],update_all:[['added','新增消息'],['changed','更新消息'],['reused','复用记录']],transcribe:[['success','新转写成功'],['reused','复用成功结果'],['skipped','无需转写 · 已跳过'],['missing','媒体缺失'],['failed','失败'],['remaining','未处理']]};
 export default function TaskFeedback({task,account,chats,onStop,onRetry,onSettings,onCleanup,blocked=false}:{task:Task;account:string;chats:{username:string;name:string}[];onStop:()=>void;onRetry:()=>void;onSettings:()=>void;onCleanup?:()=>void;blocked?:boolean}){
  const running=['running','cancelling'].includes(task.status),r=task.result;
+ const [copyState,setCopyState]=useState('');
+ useEffect(()=>setCopyState(''),[task.id]);
+ async function copy(){try{const response=await fetch('/api/runtime-summary');if(!response.ok)throw Error('运行位置读取失败');const runtime=await response.json();await navigator.clipboard.writeText(JSON.stringify({runtime,task:{id:task.id,action:task.action,status:task.status,stage:task.stage,failed_stage:task.failed_stage,reason:task.reason,error_location:task.error_location,diagnostic:task.diagnostic,next_step:task.next_step}},null,2));setCopyState('本次诊断已复制')}catch(e){setCopyState('复制失败：'+(e as Error).message)}}
  return <section className="task-feedback" aria-label={taskName(task.action)}>
   <div className="task-heading"><h3>{taskName(task.action)}</h3><span className={'tag '+(task.status==='failed'?'danger':'')} role="status">{task.diagnostic_code==='partial'?'部分完成':states[task.status]}</span></div>
   <div className="task-progress" aria-busy={running}><strong>{['完成','已停止'].includes(task.stage)?'本次处理进度':task.stage}</strong><div className="progress-slot">{task.total>0?<><progress aria-label={task.stage} value={task.done} max={task.total}/><span>{task.done.toLocaleString()} / {task.total.toLocaleString()} {task.unit}</span></>:<span>{running?`${task.done>0?`已发现 ${task.done} ${task.unit}；`:''}正在处理，当前阶段总量尚未确定。`:''}</span>}</div><p className="task-activity">{running?task.activity||'正在处理当前阶段…':''}</p></div>
@@ -19,6 +23,6 @@ export default function TaskFeedback({task,account,chats,onStop,onRetry,onSettin
   {r?.errors?.map((e:{reason:string;count:number},i:number)=><details key={i} className="task-error"><summary>{e.count} 条语音失败：{e.reason.split('\n')[0].slice(0,160)}</summary><pre>{e.reason}</pre></details>)}
   {task.next_step&&!running&&<p>{task.next_step}</p>}
   <details className="task-scope"><summary>{account} · {task.voice_targets?`${task.voice_targets.length} 条语音 / `:''}{task.selected_count?`${task.selected_count} 个会话`:'当前账号'} · 核对固定范围</summary><div className="scope-list">{task.selected_usernames?.map(u=><div className="selection-line" key={u}>{chats.find(c=>c.username===u)?.name||u}<small>{u}</small></div>)}</div></details>
-  {(task.diagnostic||task.failed_stage||task.error_location||r?.device||r?.notes?.length)&&<details><summary>诊断与工具详情</summary>{task.failed_stage&&<p>失败阶段：{task.failed_stage}</p>}{task.error_location&&<p>错误位置：{task.error_location}</p>}{r?.device&&<p>识别设备：{r.device}</p>}{r?.notes?.map((n:string)=><p key={n}>{n}</p>)}{task.diagnostic&&<pre>{JSON.stringify(task.diagnostic,null,2)}</pre>}</details>}
+  <details><summary>诊断与工具详情</summary><button onClick={copy}>复制本次诊断</button>{copyState&&<p role="status">{copyState}</p>}{task.failed_stage&&<p>失败阶段：{task.failed_stage}</p>}{task.error_location&&<p>错误位置：{task.error_location}</p>}{r?.device&&<p>识别设备：{r.device}</p>}{r?.notes?.map((n:string)=><p key={n}>{n}</p>)}{task.diagnostic&&<pre>{JSON.stringify(task.diagnostic,null,2)}</pre>}</details>
  </section>
 }
