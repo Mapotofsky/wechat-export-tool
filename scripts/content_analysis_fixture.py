@@ -16,6 +16,7 @@ def main():
     parser.add_argument('--desktop', action='store_true')
     parser.add_argument('--port', type=int, default=8767)
     parser.add_argument('--lexical', action='store_true', help='词句筛选、专名、新词与别名验收材料')
+    parser.add_argument('--u5', action='store_true', help='导航验收：长排行及多页片段')
     args = parser.parse_args()
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -34,7 +35,7 @@ def main():
     with closing(archive.connect()) as c, c:
         for username, name in [('a','合成研发群'),('b','合成协作群')]:
             c.execute('INSERT INTO chats VALUES (?,?)', (username,json.dumps(dict(username=username,name=name,category='group'))))
-            for i in range(44):
+            for i in range(144 if args.u5 else 44):
                 previous = i < 28
                 j = i if previous else i-28
                 messages = ['这版语音识别不支持API批量导出，合同没收到。',
@@ -58,16 +59,27 @@ def main():
                                   '新版星澜智研已经就绪。']
                     text=('微信消息需要核对。' if j<5 else 'WeChat收到通知。' if j<8 else '周末运动。') if previous else current_texts[j%len(current_texts)]
                 stamp=start+(-86400 if previous else 0)+(j//6)*7200+(j%6)*60
+                if args.u5:
+                    stamp=start+(-86400 if previous else 0)+j*600
+                    text=('周末运动，合同审批已经提交。' if previous else
+                          ['API不支持批量导出，合同没收到，需要核对采样率。',
+                           '语音识别请保留原始音频和日志。',
+                           '合同审批已经提交，采样率需要核对。'][j%3])
                 kind=34 if not previous and j==14 else 1
                 m=dict(timestamp=stamp,time=dt.datetime.fromtimestamp(stamp).isoformat(' '),type=kind,
                        type_name='语音' if kind==34 else '文本',content='[语音]' if kind==34 else text,
-                       sender='合成甲' if j%2 else '合成乙',sender_username='self' if j%2 else 'peer',
+                       sender=('合成参与者'+str(j%24)) if args.u5 else ('合成甲' if j%2 else '合成乙'),sender_username=('peer'+str(j%24)) if args.u5 else ('self' if j%2 else 'peer'),
                        sort_seq=i,local_id=i,source_shard='synthetic.db')
                 c.execute('INSERT INTO messages VALUES (?,?,?,?,?)',(username,'server:'+str(i),stamp,json.dumps(m),''))
             archive.metadata(c, username, dict(username=username,name=name,category='group'))
     for username in ('a','b'):
         archive.save_transcript(username,'server:42',b'synthetic','success','微信 WeChat 支持方案甲，但不支持方案乙。' if args.lexical else 'API不支持批量导出，合同没收到。')
     archive.save_config(dict(self_username='self',view_state=dict(active='a',ms='2026-10-19',me='2026-10-19')))
+    if args.u5:
+        other = dict(id='synthetic-other', label='合成空档案账号', directory=str(root/'other-source'), mode='plaintext')
+        manager.registry['accounts'].append(other)
+        manager.archive(other).save_config(dict(self_username='other-self'))
+        atomic_json(manager.registry_path, manager.registry)
     web.manager.executor.shutdown()
     web.manager = manager
     req=web.AnalysisReq(account_id=account['id'],usernames=['a','b'],start=start-36000,end=start+50399,anchor='api')

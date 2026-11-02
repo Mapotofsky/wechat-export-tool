@@ -1,0 +1,83 @@
+// Playwright CLI; run only against scripts/content_analysis_fixture.py --u5 --serve.
+async page => {
+ page.setDefaultTimeout(10000);
+ const origin=page.url().split('/').slice(0,3).join('/');const status=await (await page.request.get(origin+'/api/data-status')).json();if(status.account.id!=='synthetic-content')throw Error('Requires isolated U5 content fixture');
+ await page.request.post(origin+'/api/view-state',{data:{account_id:'synthetic-content',active:'a',offset:0,ms:'2026-10-19',me:'2026-10-19',scroll:0}});
+ const checks=[],metrics=[];let requests=0;
+ const count=r=>{if(r.url().endsWith('/api/analysis'))requests++};page.on('request',count);
+ const check=(ok,name)=>{if(!ok)throw Error(name);checks.push(name)};
+ const button=name=>page.getByRole('button',{name,exact:true});
+ const tab=name=>page.getByRole('tab',{name,exact:true});
+ const tick=()=>page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));
+ const activate=async name=>{await tab(name).click();await tick()};
+ const settle=async()=>{await page.locator('.analysis-results:not([hidden]) .analysis-metrics').waitFor();await page.waitForFunction(()=>!document.querySelector('.analysis-results')?.getAttribute('aria-busy')?.includes('true'));await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))))};
+ const position=()=>page.locator('.reading-scroll').evaluate(el=>el.scrollTop);
+ const scroll=async n=>{await page.locator('.reading-scroll').evaluate((el,n)=>el.scrollTop=n,n);await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))))};
+ const focus=()=>page.evaluate(()=>document.activeElement?.getAttribute('data-source'));
+ for(const size of [{width:1366,height:860},{width:900,height:600},{width:680,height:860}]){
+  await page.setViewportSize(size);await page.reload();await button('分析').click();await settle();
+  await page.evaluate(()=>{const el=document.querySelector('.reading-scroll');window.u5={distance:0,last:el.scrollTop};el.addEventListener('scroll',()=>{window.u5.distance+=Math.abs(el.scrollTop-window.u5.last);window.u5.last=el.scrollTop})});
+  const start=requests;
+  for(const name of ['讨论片段','活动变化','词句与变化']){await activate(name);await activate('词句与变化');await activate('时期与提及变化');check(await page.getByRole('heading',{name:'两期提及变化',exact:true}).isVisible(),size.width+': comparison reachable from '+name)}
+  const comparison=page.locator('#terms-region-panel-comparison');
+  check((await comparison.innerText()).includes('条可用文字'),'comparison denominators adjacent');
+  check(await comparison.getByText('对比开始',{exact:true}).isVisible(),'comparison controls adjacent');
+  await page.getByRole('heading',{name:'两期提及变化',exact:true}).scrollIntoViewIfNeeded();await tick();
+  const discovery=await page.evaluate(()=>({distance:window.u5.distance,height:document.querySelector('.reading-scroll').clientHeight}));
+  const source=page.locator('.change-list>button').nth(3);await source.scrollIntoViewIfNeeded();await source.focus();
+  const sourceKey=await source.getAttribute('data-source'),sourceTop=await position();await source.click();
+  await page.locator('.analysis-evidence .message').first().waitFor();
+  check(await page.getByRole('heading',{name:'前期原文',exact:true}).isVisible(),'two periods loaded');
+  await button('全部命中').click();
+  const evidence=page.locator('.analysis-evidence');
+  const contextButton=evidence.getByRole('button',{name:'查看前后文',exact:true}).first();await contextButton.click();
+  await page.locator('.analysis-evidence .target').waitFor();await button('返回分析命中').click();await tick();
+  check((await focus())?.startsWith('context:')===true,'context restores evidence focus');
+  await button('返回时期与提及变化').click();await tick();
+  check(await focus()===sourceKey,'comparison restores source focus');
+  check(Math.abs(await position()-sourceTop)<3,'comparison restores scroll');
+  await page.evaluate(()=>{window.u5.distance=0;window.u5.last=document.querySelector('.reading-scroll').scrollTop});
+  await activate('关键词时间对比');
+  await page.getByRole('heading',{name:'关键词时间对比',exact:true}).scrollIntoViewIfNeeded();await tick();const keywordDiscovery=await page.evaluate(()=>({distance:window.u5.distance,height:document.querySelector('.reading-scroll').clientHeight}));
+  const draft=page.getByLabel('关键词（逗号分隔）');await draft.fill('合同，采样率');await button('比较关键词').click();await settle();
+  check(await page.getByRole('heading',{name:/合同 ·/}).isVisible(),'applied keyword chart');
+  await scroll(110);await draft.fill('合同，采样率，未应用');await tick();const keywordTop=await position();
+  await activate('时期与提及变化');await activate('关键词时间对比');
+  check(await draft.inputValue()==='合同，采样率，未应用','keyword draft retained');check(await page.getByRole('heading',{name:/合同 ·/}).isVisible(),'applied words retained');
+  check(Math.abs(await position()-keywordTop)<3,`keyword position retained: ${await position()} / ${keywordTop}`);
+  for(const name of ['讨论片段','活动变化','词句与变化']){await activate(name);await activate('词句与变化');await activate('关键词时间对比');check(await draft.isVisible(),size.width+': keyword comparison reachable from '+name)}
+  const unchanged=requests;await activate('词句与关联');await activate('短语');await activate('词频');
+  const terms=page.locator('#term-kind-panel-words');const expansion=terms.locator('summary').filter({hasText:/展开其余/});if(await expansion.count())await expansion.click();
+  const term=terms.locator(':scope>.expression-list>button').filter({hasText:'合同'}).first();await term.click();await settle();
+  check(await term.getAttribute('aria-pressed')==='true','selected expression highlighted');
+  check(!(await evidence.count()),'selecting term does not open evidence');
+  const associations=terms.locator('.term-association');check(await associations.isVisible(),'association adjacent to selected term');
+  const common=associations.getByRole('button',{name:/查看共同命中/}).first();const commonKey=await common.getAttribute('data-source');await common.click();await evidence.locator('.message').first().waitFor();
+  await button('返回词句与关联').click();await tick();check(await focus()===commonKey,'association source focus restored');
+  check(await term.getAttribute('aria-pressed')==='true','selected expression retained');
+  if(await expansion.count())check(await expansion.evaluate(el=>el.parentElement.open),'expanded terms retained');
+  await activate('讨论片段');await page.getByLabel('无新消息间隔（分钟）').fill('5');await button('应用间隔').click();await settle();
+  await button('更早的片段').click();await settle();
+  const segment=page.locator('.activity-segment').nth(8).getByRole('button',{name:/阅读片段命中/});await segment.scrollIntoViewIfNeeded();await segment.focus();const segmentTop=await position(),segmentKey=await segment.getAttribute('data-source');await segment.click();
+  await evidence.locator('.message').first().waitFor();await evidence.getByRole('button',{name:'查看前后文',exact:true}).first().click();await evidence.locator('.target').waitFor();await button('返回分析命中').click();await tick();await button('返回讨论片段').click();await tick();
+  check(await focus()===segmentKey,'segment source focus restored');check(Math.abs(await position()-segmentTop)<3,'segment page position restored');
+  check(await page.getByLabel('无新消息间隔（分钟）').inputValue()==='5','segment gap retained');check((await page.locator('.analysis-pagination').filter({visible:true}).innerText()).includes('31–60'),'second segment page retained');
+  const pure=requests;
+  await activate('活动变化');await activate('参与者');
+  const ranks=page.locator('#activity-region-panel-people .rank-row');check(await ranks.count()===12,'rank defaults to twelve');
+  await page.locator('#activity-region-panel-people').getByRole('button',{name:/展开其余/}).click();check(await ranks.count()===24,'rank expands in main flow');
+  await page.locator('#activity-region-panel-people select').selectOption({index:3});
+  await scroll(150);const peopleTop=await position();
+  await activate('时间');await activate('词句与变化');await activate('关键词时间对比');await activate('讨论片段');await page.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));const beforeRead=await position();await button('阅读').click();await button('分析').click();await settle();
+  check(await tab('讨论片段').getAttribute('aria-selected')==='true','ordinary reading returns to section');check(Math.abs(await position()-beforeRead)<3,`ordinary reading restores analysis position: ${await position()} / ${beforeRead} (segment ${segmentTop})`);
+  await activate('活动变化');await activate('参与者');check(Math.abs(await position()-peopleTop)<3,`region scroll retained: ${await position()} / ${peopleTop}`);
+  check(requests===pure,'pure navigation issues zero full requests');
+  await tab('词句与变化').focus();await page.keyboard.press('Home');check(await tab('活动变化').evaluate(el=>el===document.activeElement),'Home moves focus');await page.keyboard.press('End');check(await tab('讨论片段').evaluate(el=>el===document.activeElement),'End moves focus');
+  check(await tab('活动变化').getAttribute('aria-selected')==='true','focus alone does not activate');await page.keyboard.press('Enter');check(await tab('讨论片段').getAttribute('aria-selected')==='true','Enter activates');await page.keyboard.press('ArrowLeft');await page.keyboard.press('Space');check(await tab('词句与变化').getAttribute('aria-selected')==='true','Space activates');check(requests===pure,'keyboard focus and activation reuse result');
+  check(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),'no page horizontal overflow');
+  check(await page.locator('.rank-chart').evaluateAll(els=>els.every(el=>!['auto','scroll'].includes(getComputedStyle(el).overflowY))),'rank has no nested vertical scroll');
+  metrics.push({size,discovery,keywordDiscovery,navigationActivations:2,discoveryExpansions:0,pureSwitchRequests:requests-pure,completeRequests:requests-start,keywordPosition:keywordTop,segmentPosition:segmentTop,unchangedBeforeAnchor:unchanged});
+  await page.screenshot({path:`output/playwright/u5-after-${size.width}.png`});
+ }
+ page.off('request',count);return {checks,metrics};
+}
