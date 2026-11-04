@@ -50,6 +50,35 @@ def shard(root, index, username, rows):
 
 
 class MaintenanceTests(unittest.TestCase):
+    def test_cleanup_keeps_published_snapshots_and_releases_replaced_generations(self):
+        import encrypted_sync
+        root = self.archive.directory / 'decrypted'
+        paths = [root / (str(i) * 32) for i in range(6)]
+        for path in paths:
+            path.mkdir(parents=True)
+            (path / 'sample.db').write_bytes(b'data')
+        other = root / 'manual-backup'
+        other.mkdir()
+        config = dict(zip(('decrypted_dir', 'message_snapshot', 'media_snapshot'), map(str, paths[:3])))
+        encrypted_sync.prune_generations(self.archive.directory, config)
+        self.assertEqual(set(root.iterdir()), set(paths[:3] + [other]))
+        config.update(decrypted_dir=str(paths[2]), message_snapshot=str(paths[2]))
+        encrypted_sync.prune_generations(self.archive.directory, config)
+        self.assertEqual(set(root.iterdir()), {paths[2], other})
+
+    def test_cleanup_failure_records_only_obsolete_directory(self):
+        import encrypted_sync
+        from task_lifecycle import CleanupError
+        root = self.archive.directory / 'decrypted'
+        current, obsolete = root / ('a' * 32), root / ('b' * 32)
+        current.mkdir(parents=True)
+        obsolete.mkdir()
+        with patch.object(encrypted_sync.shutil, 'rmtree', side_effect=PermissionError('busy')):
+            with self.assertRaises(CleanupError) as caught:
+                encrypted_sync.prune_generations(self.archive.directory, {'decrypted_dir': str(current)})
+        self.assertEqual(Path(caught.exception.resource['path']), obsolete)
+        self.assertTrue(current.is_dir())
+
     def test_state_publication_retries_transient_permission_error(self):
         target = self.root / 'progress.json'
         atomic_json(target, {'done': 1})

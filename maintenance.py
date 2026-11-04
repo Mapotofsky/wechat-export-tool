@@ -367,7 +367,6 @@ class Manager:
     def perform(self, account, archive, task, action, usernames):
         task_path = archive.directory / 'task.json'
         cancellation = self.cancellation or Cancellation()
-        generation = None
         keys = None
         outcome = 'failed'
         final_stage = None
@@ -405,6 +404,7 @@ class Manager:
                 task['activity'] = message
         try:
             config = archive.config()
+            encrypted_sync.prune_generations(archive.directory, config)
             file_plan = preparation.plan(account, archive, action, usernames, task.get('voice_targets'))
             preparation.require_capacity(preparation.capacity(file_plan, archive))
             manifest = {}
@@ -463,7 +463,6 @@ class Manager:
                     db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
                                                           config['keys_file'], [db_dir, config.get('message_snapshot'), config.get('media_snapshot')], progress,
                                                           contacts_only=False, media=media_needed)
-                    generation = db_dir
                 if action in ('prepare', 'discover'):
                     published = {}
                     if account['mode'] == 'encrypted':
@@ -500,7 +499,6 @@ class Manager:
                     if account['mode'] == 'encrypted':
                         db_dir, manifest = encrypted_sync.sync(account['directory'], archive.directory,
                             config['keys_file'], [config.get('decrypted_dir'), config.get('media_snapshot')], progress, contacts_only=True, media=True)
-                        generation = db_dir
                         cancellation.publish(lambda: archive.save_config({'decrypted_dir': str(db_dir), 'media_snapshot': str(db_dir),
                                              'message_snapshot': config.get('message_snapshot') or config.get('decrypted_dir')}))
                         with self.lock:
@@ -585,15 +583,15 @@ class Manager:
         finally:
             try:
                 config = archive.config()
-                if generation and str(generation) not in {config.get('decrypted_dir'), config.get('message_snapshot'), config.get('media_snapshot')}:
-                    shutil.rmtree(generation)
+                encrypted_sync.prune_generations(archive.directory, config)
                 if keys and str(keys) != config.get('keys_file'):
                     keys.unlink(missing_ok=True)
             except OSError as exc:
                 outcome = 'failed'
                 task.update(reason=f'临时文件清理失败：{exc}', next_step='检查数据目录权限后重试清理临时文件；已保存的结果保留')
-                if generation and Path(generation).exists():
-                    task.setdefault('cleanup_resources', []).append({'path': str(generation), 'directory': True})
+                if isinstance(exc, CleanupError):
+                    if exc.resource not in task.setdefault('cleanup_resources', []):
+                        task['cleanup_resources'].append(exc.resource)
                 if keys and keys.exists() and str(keys) != config.get('keys_file'):
                     task.setdefault('cleanup_resources', []).append({'path': str(keys), 'directory': False})
             with self.lock:

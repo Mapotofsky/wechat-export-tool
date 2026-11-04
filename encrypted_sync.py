@@ -229,6 +229,27 @@ def preparation_files(source, contacts_only=False, media=False):
                   (list((source / 'message').glob('media_*.db')) if media else []))
 
 
+def obsolete_generations(account_dir, config):
+    """Only app-owned generations no longer referenced by published settings."""
+    root = (Path(account_dir) / 'decrypted').resolve()
+    retained = {Path(config[key]).resolve() for key in
+                ('decrypted_dir', 'message_snapshot', 'media_snapshot') if config.get(key)}
+    if not root.is_dir():
+        return []
+    return [path for path in root.iterdir()
+            if len(path.name) == 32 and all(c in '0123456789abcdef' for c in path.name)
+            and path.is_dir() and not path.is_symlink() and path.resolve().parent == root
+            and path.resolve() not in retained]
+
+
+def prune_generations(account_dir, config):
+    for path in obsolete_generations(account_dir, config):
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            raise CleanupError(path, True, exc) from exc
+
+
 def sync(source, account_dir, keys_file, previous=None, progress=lambda *args: None, contacts_only=False, media=False):
     generation = Path(account_dir) / 'decrypted' / uuid.uuid4().hex
     generation.mkdir(parents=True)
